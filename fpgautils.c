@@ -18,6 +18,7 @@
 
 #include <ctype.h>
 #include <stdarg.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <sys/types.h>
@@ -46,6 +47,13 @@
 #endif
 #else  /* WIN32 */
 #include <windows.h>
+
+#ifdef HAVE_WIN_DDKUSB
+#include <setupapi.h>
+#include <usbioctl.h>
+#include <usbiodef.h>
+#endif
+
 #include <io.h>
 
 #include <utlist.h>
@@ -59,8 +67,10 @@ __stdcall FT_STATUS (*FT_ListDevices)(PVOID pArg1, PVOID pArg2, DWORD Flags);
 __stdcall FT_STATUS (*FT_Open)(int idx, FT_HANDLE*);
 __stdcall FT_STATUS (*FT_GetComPortNumber)(FT_HANDLE, LPLONG lplComPortNumber);
 __stdcall FT_STATUS (*FT_Close)(FT_HANDLE);
+const uint32_t FT_OPEN_BY_SERIAL_NUMBER =     1;
 const uint32_t FT_OPEN_BY_DESCRIPTION =       2;
 const uint32_t FT_LIST_ALL         = 0x20000000;
+const uint32_t FT_LIST_BY_INDEX    = 0x40000000;
 const uint32_t FT_LIST_NUMBER_ONLY = 0x80000000;
 enum {
 	FT_OK,
@@ -73,53 +83,13 @@ enum {
 #endif
 
 #include "logging.h"
+#include "lowlevel.h"
 #include "miner.h"
+#include "util.h"
+
 #include "fpgautils.h"
 
-#define SEARCH_NEEDLES_BEGIN()  {  \
-	const char *needle;  \
-	bool __cont = false;  \
-	va_list ap;  \
-	va_copy(ap, needles);  \
-	while ( (needle = va_arg(ap, const char *)) )  \
-	{
-
-#define SEARCH_NEEDLES_END(...)  \
-	}  \
-	va_end(ap);  \
-	if (__cont)  \
-	{  \
-		__VA_ARGS__;  \
-	}  \
-}
-
-static inline
-bool search_needles(const char *haystack, va_list needles)
-{
-	bool rv = true;
-	SEARCH_NEEDLES_BEGIN()
-		if (!strstr(haystack, needle))
-		{
-			rv = false;
-			break;
-		}
-	SEARCH_NEEDLES_END()
-	return rv;
-}
-
-#define SEARCH_NEEDLES(haystack)  search_needles(haystack, needles)
-
-static
-int _detectone_wrap(const detectone_func_t detectone, const char * const param, const char *fname)
-{
-	if (bfg_claim_serial(NULL, false, param))
-	{
-		applog(LOG_DEBUG, "%s: %s is already claimed, skipping probe", fname, param);
-		return 0;
-	}
-	return detectone(param);
-}
-#define detectone(param)  _detectone_wrap(detectone, param, __func__)
+struct lowlevel_driver lowl_vcom;
 
 struct detectone_meta_info_t detectone_meta_info;
 
@@ -128,6 +98,28 @@ void clear_detectone_meta_info(void)
 	detectone_meta_info = (struct detectone_meta_info_t){
 		.manufacturer = NULL,
 	};
+}
+
+static char *_vcom_unique_id(const char *);
+
+struct lowlevel_device_info *_vcom_devinfo_findorcreate(struct lowlevel_device_info ** const devinfo_list, const char * const devpath)
+{
+	struct lowlevel_device_info *devinfo;
+	char * const devid = _vcom_unique_id(devpath);
+	HASH_FIND_STR(*devinfo_list, devid, devinfo);
+	if (!devinfo)
+	{
+		devinfo = malloc(sizeof(*devinfo));
+		*devinfo = (struct lowlevel_device_info){
+			.lowl = &lowl_vcom,
+			.path = strdup(devpath),
+			.devid = devid,
+		};
+		HASH_ADD_KEYPTR(hh, *devinfo_list, devinfo->devid, strlen(devid), devinfo);
+	}
+	else
+		free(devid);
+	return devinfo;
 }
 
 #ifdef HAVE_LIBUDEV
@@ -165,14 +157,15 @@ char *_decode_udev_enc_dup(const char *s)
 }
 
 static
-int _serial_autodetect_udev(detectone_func_t detectone, va_list needles)
+void _vcom_devinfo_scan_udev(struct lowlevel_device_info ** const devinfo_list)
 {
 	struct udev *udev = udev_new();
 	struct udev_enumerate *enumerate = udev_enumerate_new(udev);
 	struct udev_list_entry *list_entry;
-	char found = 0;
+	struct lowlevel_device_info *devinfo;
 
 	udev_enumerate_add_match_subsystem(enumerate, "tty");
+	udev_enumerate_add_match_property(enumerate, "ID_SERIAL", "*");
 	udev_enumerate_scan_devices(enumerate);
 	udev_list_entry_foreach(list_entry, udev_enumerate_get_list_entry(enumerate)) {
 		struct udev_device *device = udev_device_new_from_syspath(
@@ -182,71 +175,46 @@ int _serial_autodetect_udev(detectone_func_t detectone, va_list needles)
 		if (!device)
 			continue;
 
-		const char *model = udev_device_get_property_value(device, "ID_MODEL");
-		if (!(model && SEARCH_NEEDLES(model)))
-		{
-			udev_device_unref(device);
-			continue;
-		}
-
-		detectone_meta_info = (struct detectone_meta_info_t){
-			.manufacturer = _decode_udev_enc_dup(udev_device_get_property_value(device, "ID_VENDOR_ENC")),
-			.product = _decode_udev_enc_dup(udev_device_get_property_value(device, "ID_MODEL_ENC")),
-			.serial = _decode_udev_enc_dup(udev_device_get_property_value(device, "ID_SERIAL_SHORT")),
-		};
+		const char * const devpath = udev_device_get_devnode(device);
+		devinfo = _vcom_devinfo_findorcreate(devinfo_list, devpath);
 		
-		const char *devpath = udev_device_get_devnode(device);
-		if (devpath && detectone(devpath))
-			++found;
-
-		free((void*)detectone_meta_info.manufacturer);
-		free((void*)detectone_meta_info.product);
-		free((void*)detectone_meta_info.serial);
+		BFGINIT(devinfo->manufacturer, _decode_udev_enc_dup(udev_device_get_property_value(device, "ID_VENDOR_ENC")));
+		BFGINIT(devinfo->product, _decode_udev_enc_dup(udev_device_get_property_value(device, "ID_MODEL_ENC")));
+		BFGINIT(devinfo->serial, _decode_udev_enc_dup(udev_device_get_property_value(device, "ID_SERIAL_SHORT")));
+		
 		udev_device_unref(device);
 	}
 	udev_enumerate_unref(enumerate);
 	udev_unref(udev);
-	clear_detectone_meta_info();
-
-	return found;
 }
-#else
-#	define _serial_autodetect_udev(...)  (0)
 #endif
 
 #ifndef WIN32
 static
-int _serial_autodetect_devserial(detectone_func_t detectone, va_list needles)
+void _vcom_devinfo_scan_devserial(struct lowlevel_device_info ** const devinfo_list)
 {
 	DIR *D;
 	struct dirent *de;
 	const char udevdir[] = "/dev/serial/by-id";
 	char devpath[sizeof(udevdir) + 1 + NAME_MAX];
 	char *devfile = devpath + sizeof(udevdir);
-	char found = 0;
-
-	// No way to split this out of the filename reliably
-	clear_detectone_meta_info();
+	struct lowlevel_device_info *devinfo;
 	
 	D = opendir(udevdir);
 	if (!D)
-		return 0;
+		return;
 	memcpy(devpath, udevdir, sizeof(udevdir) - 1);
 	devpath[sizeof(udevdir) - 1] = '/';
 	while ( (de = readdir(D)) ) {
-		if (!SEARCH_NEEDLES(de->d_name))
+		if (strncmp(de->d_name, "usb-", 4))
 			continue;
-		
 		strcpy(devfile, de->d_name);
-		if (detectone(devpath))
-			++found;
+		devinfo = _vcom_devinfo_findorcreate(devinfo_list, devpath);
+		if (!(devinfo->manufacturer || devinfo->product || devinfo->serial))
+			devinfo->product = strdup(devfile);
 	}
 	closedir(D);
-
-	return found;
 }
-#else
-#	define _serial_autodetect_devserial(...)  (0)
 #endif
 
 #ifndef WIN32
@@ -276,8 +244,9 @@ char *_sysfs_do_read(char *buf, size_t bufsz, const char *devpath, char *devfile
 }
 
 static
-void _sysfs_find_tty(detectone_func_t detectone, char *devpath, char *devfile, const char *prod, char *pfound)
+void _sysfs_find_tty(char *devpath, char *devfile, const char *prod, struct lowlevel_device_info ** const devinfo_list)
 {
+	struct lowlevel_device_info *devinfo;
 	DIR *DT;
 	struct dirent *de;
 	char ttybuf[0x10] = "/dev/";
@@ -296,22 +265,17 @@ void _sysfs_find_tty(detectone_func_t detectone, char *devpath, char *devfile, c
 		{
 			// "tty" directory: recurse (needed for ttyACM)
 			sprintf(devfile, "%s/tty", mydevfile);
-			_sysfs_find_tty(detectone, devpath, devfile, prod, pfound);
+			_sysfs_find_tty(devpath, devfile, prod, devinfo_list);
 			continue;
 		}
 		if (strncmp(&de->d_name[3], "USB", 3) && strncmp(&de->d_name[3], "ACM", 3))
 			continue;
 		
-		
-		detectone_meta_info = (struct detectone_meta_info_t){
-			.manufacturer = _sysfs_do_read(manuf, sizeof(manuf), devpath, devfile, "/manufacturer"),
-			.product = prod,
-			.serial = _sysfs_do_read(serial, sizeof(serial), devpath, devfile, "/serial"),
-		};
-		
 		strcpy(&ttybuf[5], de->d_name);
-		if (detectone(ttybuf))
-			++*pfound;
+		devinfo = _vcom_devinfo_findorcreate(devinfo_list, ttybuf);
+		BFGINIT(devinfo->manufacturer, maybe_strdup(_sysfs_do_read(manuf, sizeof(manuf), devpath, devfile, "/manufacturer")));
+		BFGINIT(devinfo->product, maybe_strdup(prod));
+		BFGINIT(devinfo->serial, maybe_strdup(_sysfs_do_read(serial, sizeof(serial), devpath, devfile, "/serial")));
 	}
 	closedir(DT);
 	
@@ -320,7 +284,7 @@ out:
 }
 
 static
-int _serial_autodetect_sysfs(detectone_func_t detectone, va_list needles)
+void _vcom_devinfo_scan_sysfs(struct lowlevel_device_info ** const devinfo_list)
 {
 	DIR *D, *DS;
 	struct dirent *de;
@@ -329,12 +293,11 @@ int _serial_autodetect_sysfs(detectone_func_t detectone, va_list needles)
 	char devpath[sizeof(devroot) + (NAME_MAX * 3)];
 	char prod[0x40];
 	char *devfile, *upfile;
-	char found = 0;
 	size_t len, len2;
 	
 	D = opendir(devroot);
 	if (!D)
-		return 0;
+		return;
 	memcpy(devpath, devroot, devrootlen);
 	devpath[devrootlen] = '/';
 	while ( (de = readdir(D)) )
@@ -345,10 +308,7 @@ int _serial_autodetect_sysfs(detectone_func_t detectone, va_list needles)
 		devfile = upfile + len;
 		
 		if (!_sysfs_do_read(prod, sizeof(prod), devpath, devfile, "/product"))
-			continue;
-		
-		if (!SEARCH_NEEDLES(prod))
-			continue;
+			prod[0] = '\0';
 		
 		devfile[0] = '\0';
 		DS = opendir(devpath);
@@ -365,18 +325,237 @@ int _serial_autodetect_sysfs(detectone_func_t detectone, va_list needles)
 			len2 = strlen(de->d_name);
 			memcpy(devfile, de->d_name, len2 + 1);
 			
-			_sysfs_find_tty(detectone, devpath, devfile, prod, &found);
+			_sysfs_find_tty(devpath, devfile, prod[0] ? prod : NULL, devinfo_list);
 		}
 		closedir(DS);
 	}
 	closedir(D);
-	clear_detectone_meta_info();
-	
-	return found;
 }
-#else
-#	define _serial_autodetect_sysfs(...)  (0)
 #endif
+
+#ifdef HAVE_WIN_DDKUSB
+
+static const GUID WIN_GUID_DEVINTERFACE_USB_HOST_CONTROLLER = { 0x3ABF6F2D, 0x71C4, 0x462A, {0x8A, 0x92, 0x1E, 0x68, 0x61, 0xE6, 0xAF, 0x27} };
+
+static
+char *windows_usb_get_port_path(HANDLE hubh, const int portno)
+{
+	size_t namesz;
+	ULONG rsz;
+	
+	{
+		USB_NODE_CONNECTION_NAME pathinfo = {
+			.ConnectionIndex = portno,
+		};
+		if (!(DeviceIoControl(hubh, IOCTL_USB_GET_NODE_CONNECTION_NAME, &pathinfo, sizeof(pathinfo), &pathinfo, sizeof(pathinfo), &rsz, NULL) && rsz >= sizeof(pathinfo)))
+			applogfailinfor(NULL, LOG_ERR, "ioctl (1)", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+		namesz = pathinfo.ActualLength;
+	}
+	
+	const size_t bufsz = sizeof(USB_NODE_CONNECTION_NAME) + namesz;
+	uint8_t buf[bufsz];
+	USB_NODE_CONNECTION_NAME *path = (USB_NODE_CONNECTION_NAME *)buf;
+	*path = (USB_NODE_CONNECTION_NAME){
+		.ConnectionIndex = portno,
+	};
+	
+	if (!(DeviceIoControl(hubh, IOCTL_USB_GET_NODE_CONNECTION_NAME, path, bufsz, path, bufsz, &rsz, NULL) && rsz >= sizeof(*path)))
+		applogfailinfor(NULL, LOG_ERR, "ioctl (2)", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	
+	return ucs2tochar_dup(path->NodeName, path->ActualLength);
+}
+
+static
+char *windows_usb_get_string(HANDLE hubh, const int portno, const uint8_t descid)
+{
+	if (!descid)
+		return NULL;
+	
+	const size_t descsz_max = sizeof(USB_STRING_DESCRIPTOR) + MAXIMUM_USB_STRING_LENGTH;
+	const size_t reqsz = sizeof(USB_DESCRIPTOR_REQUEST) + descsz_max;
+	uint8_t buf[reqsz];
+	
+	USB_DESCRIPTOR_REQUEST * const req = (USB_DESCRIPTOR_REQUEST *)buf;
+	USB_STRING_DESCRIPTOR * const desc = (USB_STRING_DESCRIPTOR *)&req[1];
+	*req = (USB_DESCRIPTOR_REQUEST){
+		.ConnectionIndex = portno,
+		.SetupPacket = {
+			.wValue = (USB_STRING_DESCRIPTOR_TYPE << 8) | descid,
+			.wIndex = 0,
+			.wLength = descsz_max,
+		},
+	};
+	// Need to explicitly zero the output memory
+	memset(desc, '\0', descsz_max);
+	
+	ULONG descsz;
+	if (!DeviceIoControl(hubh, IOCTL_USB_GET_DESCRIPTOR_FROM_NODE_CONNECTION, req, reqsz, req, reqsz, &descsz, NULL))
+		applogfailinfor(NULL, LOG_DEBUG, "ioctl", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	
+	if (descsz < 2 || desc->bDescriptorType != USB_STRING_DESCRIPTOR_TYPE || desc->bLength > descsz - sizeof(USB_DESCRIPTOR_REQUEST) || desc->bLength % 2)
+		applogfailr(NULL, LOG_ERR, "sanity check");
+	
+	return ucs2tochar_dup(desc->bString, desc->bLength);
+}
+
+static void _vcom_devinfo_scan_windows__hub(struct lowlevel_device_info **, const char *);
+
+static
+void _vcom_devinfo_scan_windows__hubport(struct lowlevel_device_info ** const devinfo_list, HANDLE hubh, const int portno)
+{
+	struct lowlevel_device_info *devinfo;
+	const size_t conninfosz = sizeof(USB_NODE_CONNECTION_INFORMATION) + (sizeof(USB_PIPE_INFO) * 30);
+	uint8_t buf[conninfosz];
+	USB_NODE_CONNECTION_INFORMATION * const conninfo = (USB_NODE_CONNECTION_INFORMATION *)buf;
+	
+	conninfo->ConnectionIndex = portno;
+	
+	ULONG respsz;
+	if (!DeviceIoControl(hubh, IOCTL_USB_GET_NODE_CONNECTION_INFORMATION, conninfo, conninfosz, conninfo, conninfosz, &respsz, NULL))
+		applogfailinfor(, LOG_ERR, "ioctl", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	
+	if (conninfo->ConnectionStatus != DeviceConnected)
+		return;
+	
+	if (conninfo->DeviceIsHub)
+	{
+		const char * const hubpath = windows_usb_get_port_path(hubh, portno);
+		if (hubpath)
+			_vcom_devinfo_scan_windows__hub(devinfo_list, hubpath);
+		return;
+	}
+	
+	const USB_DEVICE_DESCRIPTOR * const devdesc = &conninfo->DeviceDescriptor;
+	char * const serial = windows_usb_get_string(hubh, portno, devdesc->iSerialNumber);
+	if (!serial)
+	{
+out:
+		free(serial);
+		return;
+	}
+	const size_t slen = strlen(serial);
+	char subkey[52 + slen + 18 + 1];
+	sprintf(subkey, "SYSTEM\\CurrentControlSet\\Enum\\USB\\VID_%04x&PID_%04x\\%s\\Device Parameters",
+	        (unsigned)devdesc->idVendor, (unsigned)devdesc->idProduct, serial);
+	HKEY hkey;
+	int e;
+	if (ERROR_SUCCESS != (e = RegOpenKey(HKEY_LOCAL_MACHINE, subkey, &hkey)))
+	{
+		applogfailinfo(LOG_ERR, "open Device Parameters registry key", "%s", bfg_strerror(e, BST_SYSTEM));
+		goto out;
+	}
+	char devpath[0x10] = "\\\\.\\";
+	DWORD type, sz = sizeof(devpath) - 4;
+	if (ERROR_SUCCESS != (e = RegQueryValueExA(hkey, "PortName", NULL, &type, (LPBYTE)&devpath[4], &sz)))
+	{
+		applogfailinfo(LOG_ERR, "get PortName registry key value", "%s", bfg_strerror(e, BST_SYSTEM));
+		RegCloseKey(hkey);
+		goto out;
+	}
+	RegCloseKey(hkey);
+	if (type != REG_SZ)
+	{
+		applogfailinfor(, LOG_ERR, "get expected type for PortName registry key value", "%ld", (long)type);
+		goto out;
+	}
+	
+	devinfo = _vcom_devinfo_findorcreate(devinfo_list, devpath);
+	BFGINIT(devinfo->manufacturer, windows_usb_get_string(hubh, portno, devdesc->iManufacturer));
+	BFGINIT(devinfo->product, windows_usb_get_string(hubh, portno, devdesc->iProduct));
+	if (devinfo->serial)
+		free(serial);
+	else
+		devinfo->serial = serial;
+}
+
+static
+void _vcom_devinfo_scan_windows__hub(struct lowlevel_device_info ** const devinfo_list, const char * const hubpath)
+{
+	HANDLE hubh;
+	USB_NODE_INFORMATION nodeinfo;
+	
+	{
+		char deviceName[4 + strlen(hubpath) + 1];
+		sprintf(deviceName, "\\\\.\\%s", hubpath);
+		hubh = CreateFile(deviceName, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+		if (hubh == INVALID_HANDLE_VALUE)
+			applogr(, LOG_ERR, "Error opening USB hub device %s for autodetect: %s", deviceName, bfg_strerror(GetLastError(), BST_SYSTEM));
+	}
+	
+	ULONG nBytes;
+	if (!DeviceIoControl(hubh, IOCTL_USB_GET_NODE_INFORMATION, &nodeinfo, sizeof(nodeinfo), &nodeinfo, sizeof(nodeinfo), &nBytes, NULL))
+		applogfailinfor(, LOG_ERR, "ioctl", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	
+	const int portcount = nodeinfo.u.HubInformation.HubDescriptor.bNumberOfPorts;
+	for (int i = 1; i <= portcount; ++i)
+		_vcom_devinfo_scan_windows__hubport(devinfo_list, hubh, i);
+	
+	CloseHandle(hubh);
+}
+
+static
+char *windows_usb_get_root_hub_path(HANDLE hcntlrh)
+{
+	size_t namesz;
+	ULONG rsz;
+	
+	{
+		USB_ROOT_HUB_NAME pathinfo;
+		if (!(DeviceIoControl(hcntlrh, IOCTL_USB_GET_ROOT_HUB_NAME, 0, 0, &pathinfo, sizeof(pathinfo), &rsz, NULL) && rsz >= sizeof(pathinfo)))
+			applogfailinfor(NULL, LOG_ERR, "ioctl (1)", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+		namesz = pathinfo.ActualLength;
+	}
+	
+	const size_t bufsz = sizeof(USB_ROOT_HUB_NAME) + namesz;
+	uint8_t buf[bufsz];
+	USB_ROOT_HUB_NAME *hubpath = (USB_ROOT_HUB_NAME *)buf;
+	
+	if (!(DeviceIoControl(hcntlrh, IOCTL_USB_GET_ROOT_HUB_NAME, NULL, 0, hubpath, bufsz, &rsz, NULL) && rsz >= sizeof(*hubpath)))
+		applogfailinfor(NULL, LOG_ERR, "ioctl (2)", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	
+	return ucs2tochar_dup(hubpath->RootHubName, hubpath->ActualLength);
+}
+
+static
+void _vcom_devinfo_scan_windows__hcntlr(struct lowlevel_device_info ** const devinfo_list, HDEVINFO *devinfo, const int i)
+{
+	SP_DEVICE_INTERFACE_DATA devifacedata = {
+		.cbSize = sizeof(devifacedata),
+	};
+	if (!SetupDiEnumDeviceInterfaces(*devinfo, 0, (LPGUID)&WIN_GUID_DEVINTERFACE_USB_HOST_CONTROLLER, i, &devifacedata))
+		applogfailinfor(, LOG_ERR, "SetupDiEnumDeviceInterfaces", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	DWORD detailsz;
+	if (!(!SetupDiGetDeviceInterfaceDetail(*devinfo, &devifacedata, NULL, 0, &detailsz, NULL) && GetLastError() == ERROR_INSUFFICIENT_BUFFER))
+		applogfailinfor(, LOG_ERR, "SetupDiEnumDeviceInterfaceDetail (1)", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	PSP_DEVICE_INTERFACE_DETAIL_DATA detail = alloca(detailsz);
+	detail->cbSize = sizeof(*detail);
+	if (!SetupDiGetDeviceInterfaceDetail(*devinfo, &devifacedata, detail, detailsz, &detailsz, NULL))
+		applogfailinfor(, LOG_ERR, "SetupDiEnumDeviceInterfaceDetail (2)", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	HANDLE hcntlrh = CreateFile(detail->DevicePath, GENERIC_WRITE, FILE_SHARE_WRITE, NULL, OPEN_EXISTING, 0, NULL);
+	if (hcntlrh == INVALID_HANDLE_VALUE)
+		applogfailinfor(, LOG_DEBUG, "open USB host controller device", "%s", bfg_strerror(GetLastError(), BST_SYSTEM));
+	char * const hubpath = windows_usb_get_root_hub_path(hcntlrh);
+	CloseHandle(hcntlrh);
+	_vcom_devinfo_scan_windows__hub(devinfo_list, hubpath);
+	free(hubpath);
+}
+
+static
+void _vcom_devinfo_scan_windows(struct lowlevel_device_info ** const devinfo_list)
+{
+	HDEVINFO devinfo;
+	devinfo = SetupDiGetClassDevs(&WIN_GUID_DEVINTERFACE_USB_HOST_CONTROLLER, NULL, NULL, (DIGCF_PRESENT | DIGCF_DEVICEINTERFACE));
+	SP_DEVINFO_DATA devinfodata = {
+		.cbSize = sizeof(devinfodata),
+	};
+	
+	for (int i = 0; SetupDiEnumDeviceInfo(devinfo, i, &devinfodata); ++i)
+		_vcom_devinfo_scan_windows__hcntlr(devinfo_list, &devinfo, i);
+	SetupDiDestroyDeviceInfoList(devinfo);
+}
+
+#endif
+
 
 #ifdef WIN32
 #define LOAD_SYM(sym)  do { \
@@ -386,7 +565,6 @@ int _serial_autodetect_sysfs(detectone_func_t detectone, va_list needles)
 	}  \
 } while(0)
 
-#ifdef UNTESTED_FTDI_DETECTONE_META_INFO
 static
 char *_ftdi_get_string(char *buf, int i, DWORD flags)
 {
@@ -394,19 +572,16 @@ char *_ftdi_get_string(char *buf, int i, DWORD flags)
 		return NULL;
 	return buf[0] ? buf : NULL;
 }
-#endif
 
 static
-int _serial_autodetect_ftdi(detectone_func_t detectone, va_list needles)
+void _vcom_devinfo_scan_ftdi(struct lowlevel_device_info ** const devinfo_list)
 {
 	char devpath[] = "\\\\.\\COMnnnnn";
 	char *devpathnum = &devpath[7];
 	char **bufptrs;
 	char *buf;
-#ifdef UNTESTED_FTDI_DETECTONE_META_INFO
-	char manuf[64], serial[64];
-#endif
-	int found = 0;
+	char serial[64];
+	struct lowlevel_device_info *devinfo;
 	DWORD i;
 
 	FT_STATUS ftStatus;
@@ -414,7 +589,7 @@ int _serial_autodetect_ftdi(detectone_func_t detectone, va_list needles)
 	HMODULE dll = LoadLibrary("FTD2XX.DLL");
 	if (!dll) {
 		applog(LOG_DEBUG, "FTD2XX.DLL failed to load, not using FTDI autodetect");
-		return 0;
+		return;
 	}
 	LOAD_SYM(FT_ListDevices);
 	LOAD_SYM(FT_Open);
@@ -440,13 +615,9 @@ int _serial_autodetect_ftdi(detectone_func_t detectone, va_list needles)
 		goto out;
 	}
 	
-	clear_detectone_meta_info();
 	for (i = numDevs; i > 0; ) {
 		--i;
 		bufptrs[i][64] = '\0';
-		
-		if (!SEARCH_NEEDLES(bufptrs[i]))
-			continue;
 		
 		FT_HANDLE ftHandle;
 		if (FT_OK != FT_Open(i, &ftHandle))
@@ -458,86 +629,134 @@ int _serial_autodetect_ftdi(detectone_func_t detectone, va_list needles)
 			continue;
 		
 		applog(LOG_ERR, "FT_GetComPortNumber(%p (%ld), %ld)", ftHandle, (long)i, (long)lComPortNumber);
-#ifdef UNTESTED_FTDI_DETECTONE_META_INFO
-		detectone_meta_info = (struct detectone_meta_info_t){
-			.product = bufptrs[i],
-			.serial = _ftdi_get_string(serial, i, FT_OPEN_BY_SERIAL_NUMBER),
-		};
-#endif
-		
 		sprintf(devpathnum, "%d", (int)lComPortNumber);
 		
-		if (detectone(devpath))
-			++found;
+		devinfo = _vcom_devinfo_findorcreate(devinfo_list, devpath);
+		BFGINIT(devinfo->product, (bufptrs[i] && bufptrs[i][0]) ? strdup(bufptrs[i]) : NULL);
+		BFGINIT(devinfo->serial, maybe_strdup(_ftdi_get_string(serial, i, FT_OPEN_BY_SERIAL_NUMBER)));
 	}
 
 out:
-	clear_detectone_meta_info();
 	dlclose(dll);
-	return found;
 }
-#else
-#	define _serial_autodetect_ftdi(...)  (0)
 #endif
 
-#undef detectone
+#ifdef WIN32
+extern void _vcom_devinfo_scan_querydosdevice(struct lowlevel_device_info **);
+#else
+extern void _vcom_devinfo_scan_lsdev(struct lowlevel_device_info **);
+#endif
 
-int _serial_autodetect(detectone_func_t detectone, ...)
+bool _serial_autodetect_found_cb(struct lowlevel_device_info * const devinfo, void *userp)
 {
-	int rv;
-	va_list needles;
-	
-	va_start(needles, detectone);
-	rv = (
-		_serial_autodetect_udev     (detectone, needles) ?:
-		_serial_autodetect_sysfs    (detectone, needles) ?:
-		_serial_autodetect_devserial(detectone, needles) ?:
-		_serial_autodetect_ftdi     (detectone, needles) ?:
-		0);
-	va_end(needles);
+	detectone_func_t detectone = userp;
+	if (bfg_claim_any(NULL, devinfo->path, devinfo->devid))
+	{
+		applog(LOG_DEBUG, "%s (%s) is already claimed, skipping probe", devinfo->path, devinfo->devid);
+		return false;
+	}
+	if (devinfo->lowl != &lowl_vcom)
+	{
+		if (devinfo->lowl != &lowl_usb)
+			applog(LOG_WARNING, "Non-VCOM %s (%s) matched", devinfo->path, devinfo->devid);
+		return false;
+	}
+	detectone_meta_info = (struct detectone_meta_info_t){
+		.manufacturer = devinfo->manufacturer,
+		.product = devinfo->product,
+		.serial = devinfo->serial,
+	};
+	const bool rv = detectone(devinfo->path);
+	clear_detectone_meta_info();
 	return rv;
 }
 
-enum bfg_device_bus {
-	BDB_SERIAL,
-	BDB_USB,
-};
+int _serial_autodetect(detectone_func_t detectone, ...)
+{
+	va_list needles;
+	char *needles_array[0x10];
+	int needlecount = 0;
+	
+	va_start(needles, detectone);
+	while ( (needles_array[needlecount++] = va_arg(needles, void *)) )
+	{}
+	va_end(needles);
+	
+	return _lowlevel_detect(_serial_autodetect_found_cb, NULL, (const char **)needles_array, detectone);
+}
 
-// TODO: claim USB side of USB-Serial devices
-typedef
-struct my_dev_t {
-	enum bfg_device_bus bus;
-	union {
-		struct {
-			uint8_t usbbus;
-			uint8_t usbaddr;
-		};
+static
+struct lowlevel_device_info *vcom_devinfo_scan()
+{
+	struct lowlevel_device_info *devinfo_hash = NULL;
+	struct lowlevel_device_info *devinfo_list = NULL;
+	struct lowlevel_device_info *devinfo, *tmp;
+	
+	// All 3 USB Strings available:
 #ifndef WIN32
-		dev_t dev;
-#else
-		int com;
+	_vcom_devinfo_scan_sysfs(&devinfo_hash);
 #endif
-	};
-} my_dev_t;
+#ifdef HAVE_WIN_DDKUSB
+	_vcom_devinfo_scan_windows(&devinfo_hash);
+#endif
+#ifdef HAVE_LIBUDEV
+	_vcom_devinfo_scan_udev(&devinfo_hash);
+#endif
+	// Missing Manufacturer:
+#ifdef WIN32
+	_vcom_devinfo_scan_ftdi(&devinfo_hash);
+#endif
+	// All blobbed together:
+#ifndef WIN32
+	_vcom_devinfo_scan_devserial(&devinfo_hash);
+#endif
+	// No info:
+#ifdef WIN32
+	_vcom_devinfo_scan_querydosdevice(&devinfo_hash);
+#else
+	_vcom_devinfo_scan_lsdev(&devinfo_hash);
+#endif
+	
+	// Convert hash to simple list
+	HASH_ITER(hh, devinfo_hash, devinfo, tmp)
+	{
+		LL_PREPEND(devinfo_list, devinfo);
+	}
+	
+	return devinfo_list;
+}
+
 
 struct _device_claim {
 	struct device_drv *drv;
-	my_dev_t dev;
+	char *devpath;
 	UT_hash_handle hh;
 };
 
-static
-struct device_drv *bfg_claim_any(struct device_drv * const api, const char * const verbose, const my_dev_t * const dev)
+struct device_drv *bfg_claim_any(struct device_drv * const api, const char *verbose, const char * const devpath)
 {
 	static struct _device_claim *claims = NULL;
 	struct _device_claim *c;
 	
-	HASH_FIND(hh, claims, dev, sizeof(*dev), c);
+	HASH_FIND_STR(claims, devpath, c);
 	if (c)
 	{
-		if (verbose)
-			applog(LOG_DEBUG, "%s device %s already claimed by other driver: %s",
-			       api->dname, verbose, c->drv->dname);
+		if (verbose && opt_debug)
+		{
+			char logbuf[LOGBUFSIZ];
+			logbuf[0] = '\0';
+			if (api)
+				tailsprintf(logbuf, sizeof(logbuf), "%s device ", api->dname);
+			if (verbose[0])
+				tailsprintf(logbuf, sizeof(logbuf), "%s (%s)", verbose, devpath);
+			else
+				tailsprintf(logbuf, sizeof(logbuf), "%s", devpath);
+			tailsprintf(logbuf, sizeof(logbuf), " already claimed by ");
+			if (api)
+				tailsprintf(logbuf, sizeof(logbuf), "other ");
+			tailsprintf(logbuf, sizeof(logbuf), "driver: %s", c->drv->dname);
+			_applog(LOG_DEBUG, logbuf);
+		}
 		return c->drv;
 	}
 	
@@ -545,59 +764,73 @@ struct device_drv *bfg_claim_any(struct device_drv * const api, const char * con
 		return NULL;
 	
 	c = malloc(sizeof(*c));
-	c->dev = *dev;
+	c->devpath = strdup(devpath);
 	c->drv = api;
-	HASH_ADD(hh, claims, dev, sizeof(*dev), c);
+	HASH_ADD_KEYPTR(hh, claims, c->devpath, strlen(devpath), c);
 	return NULL;
 }
 
-struct device_drv *bfg_claim_serial(struct device_drv * const api, const bool verbose, const char * const devpath)
+struct device_drv *bfg_claim_any2(struct device_drv * const api, const char * const verbose, const char * const llname, const char * const path)
 {
-	my_dev_t dev;
-	
-	memset(&dev, 0, sizeof(dev));
-	dev.bus = BDB_SERIAL;
+	const size_t llnamesz = strlen(llname);
+	const size_t pathsz = strlen(path);
+	char devpath[llnamesz + 1 + pathsz + 1];
+	memcpy(devpath, llname, llnamesz);
+	devpath[llnamesz] = ':';
+	memcpy(&devpath[llnamesz+1], path, pathsz + 1);
+	return bfg_claim_any(api, verbose, devpath);
+}
+
+static
+char *_vcom_unique_id(const char * const devpath)
+{
 #ifndef WIN32
+	char *devs = malloc(6 + (sizeof(dev_t) * 2) + 1);
 	{
 		struct stat my_stat;
 		if (stat(devpath, &my_stat))
 			return NULL;
-		dev.dev = my_stat.st_rdev;
+		memcpy(devs, "dev_t:", 6);
+		bin2hex(&devs[6], &my_stat.st_rdev, sizeof(dev_t));
 	}
 #else
-	{
 		char *p = strstr(devpath, "COM"), *p2;
 		if (!p)
 			return NULL;
-		dev.com = strtol(&p[3], &p2, 10);
+		const int com = strtol(&p[3], &p2, 10);
 		if (p2 == p)
 			return NULL;
-	}
+	char dummy;
+	const int sz = snprintf(&dummy, 1, "%d", com);
+	char *devs = malloc(4 + sz + 1);
+	sprintf(devs, "com:%d", com);
 #endif
-	
-	return bfg_claim_any(api, (verbose ? devpath : NULL), &dev);
+	return devs;
+}
+
+struct device_drv *bfg_claim_serial(struct device_drv * const api, const bool verbose, const char * const devpath)
+{
+	char * const devs = _vcom_unique_id(devpath);
+	if (!devs)
+		return false;
+	struct device_drv * const rv = bfg_claim_any(api, (verbose ? devpath : NULL), devs);
+	free(devs);
+	return rv;
+}
+
+char *bfg_make_devid_usb(const uint8_t usbbus, const uint8_t usbaddr)
+{
+	char * const devpath = malloc(12);
+	sprintf(devpath, "usb:%03u:%03u", (unsigned)usbbus, (unsigned)usbaddr);
+	return devpath;
 }
 
 struct device_drv *bfg_claim_usb(struct device_drv * const api, const bool verbose, const uint8_t usbbus, const uint8_t usbaddr)
 {
-	my_dev_t dev;
-	char *desc = NULL;
-	
-	// We should be able to just initialize a const my_dev_t for this, but Xcode's clang is broken
-	// Affected: Apple LLVM version 4.2 (clang-425.0.28) (based on LLVM 3.2svn) AKA Xcode 4.6.3
-	// Works with const: GCC 4.6.3, LLVM 3.1
-	memset(&dev, 0, sizeof(dev));
-	dev.bus = BDB_USB;
-	dev.usbbus = usbbus;
-	dev.usbaddr = usbaddr;
-	
-	if (verbose)
-	{
-		desc = alloca(3 + 1 + 3 + 1);
-		sprintf(desc, "%03u:%03u", (unsigned)usbbus, (unsigned)usbaddr);
-	}
-	
-	return bfg_claim_any(api, desc, &dev);
+	char * const devpath = bfg_make_devid_usb(usbbus, usbaddr);
+	struct device_drv * const rv = bfg_claim_any(api, verbose ? "" : NULL, devpath);
+	free(devpath);
+	return rv;
 }
 
 #ifdef HAVE_LIBUSB
@@ -898,6 +1131,14 @@ int serial_open(const char *devpath, unsigned long baud, uint8_t timeout, bool p
 #endif
 }
 
+int serial_close(const int fd)
+{
+#if defined(LOCK_EX) && defined(LOCK_NB) && defined(LOCK_UN)
+	flock(fd, LOCK_UN);
+#endif
+	return close(fd);
+}
+
 ssize_t _serial_read(int fd, char *buf, size_t bufsiz, char *eol)
 {
 	ssize_t len, tlen = 0;
@@ -1151,3 +1392,8 @@ int get_serial_cts(const int fd)
 	return (flags & MS_CTS_ON) ? 1 : 0;
 }
 #endif // ! WIN32
+
+struct lowlevel_driver lowl_vcom = {
+	.dname = "vcom",
+	.devinfo_scan = vcom_devinfo_scan,
+};

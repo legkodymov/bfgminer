@@ -57,6 +57,14 @@ extern void _applog(int prio, const char *str);
 	} \
 } while (0)
 
+#define applogsiz(prio, _SIZ, fmt, ...) do { \
+	if (opt_debug || prio != LOG_DEBUG) { \
+			char tmp42[_SIZ]; \
+			snprintf(tmp42, sizeof(tmp42), fmt, ##__VA_ARGS__); \
+			_applog(prio, tmp42); \
+	} \
+} while (0)
+
 #define applogr(rv, prio, ...)  do {  \
 	applog(prio, __VA_ARGS__);  \
 	return rv;  \
@@ -71,6 +79,29 @@ extern void _applog(int prio, const char *str);
 } while (0)
 
 #define perror(s)  appperror(LOG_ERR, s)
+
+#define applogfailinfo(prio, failed, fmt, ...)  do {  \
+	applog(prio, "Failed to %s"IN_FMT_FFL": "fmt,  \
+	       failed,  \
+	       __FILE__, __func__, __LINE__,  \
+	       __VA_ARGS__);  \
+} while (0)
+
+#define applogfailinfor(rv, prio, failed, fmt, ...)  do {  \
+	applogfailinfo(prio, failed, fmt, __VA_ARGS__);  \
+	return rv;  \
+} while (0)
+
+#define applogfail(prio, failed)  do {  \
+	applog(prio, "Failed to %s"IN_FMT_FFL,  \
+	       failed,  \
+	       __FILE__, __func__, __LINE__);  \
+} while (0)
+
+#define applogfailr(rv, prio, failed)  do {  \
+	applogfail(prio, failed);  \
+	return rv;  \
+} while (0)
 
 extern void _bfg_clean_up(void);
 

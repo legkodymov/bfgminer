@@ -24,13 +24,15 @@
 
 #include "config.h"
 
+#include <stdbool.h>
+
 #include "deviceapi.h"
 #include "driver-bitfury.h"
 #include "libbitfury.h"
 #include "spidevc.h"
 #include "tm_i2c.h"
 
-struct device_drv metabank_drv;
+BFG_REGISTER_DRIVER(metabank_drv)
 
 static
 bool metabank_spi_txrx(struct spi_port *port)
@@ -157,8 +159,9 @@ bool metabank_init(struct thr_info *thr)
 		proc->device_data = bitfury;
 		bitfury->spi->cgpu = proc;
 		bitfury_init_chip(proc);
-		bitfury->osc6_bits = 54;
-		send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+		bitfury->osc6_bits = 53;
+		bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+		bitfury_init_freq_stat(&bitfury->chip_stat, 52, 56);
 		
 		if (proc->proc_id == proc->procs - 1)
 			free(devicelist);
@@ -223,13 +226,11 @@ struct device_drv metabank_drv = {
 	.dname = "metabank",
 	.name = "MBF",
 	.drv_detect = metabank_detect,
-	.thread_init = metabank_init,
 	
-#if 0
-	.minerloop = hash_queued_work,
-	.thread_prepare = bitfury_prepare,
-	.scanwork = bitfury_scanHash,
-#endif
+	.thread_init = metabank_init,
+	.thread_enable = bitfury_enable,
+	.thread_disable = bitfury_disable,
+	
 	.minerloop = minerloop_async,
 	.job_prepare = bitfury_job_prepare,
 	.job_start = bitfury_noop_job_start,
@@ -241,4 +242,10 @@ struct device_drv metabank_drv = {
 	.get_api_extra_device_status = metabank_api_extra_device_status,
 	.get_stats = metabank_get_stats,
 	.set_device = bitfury_set_device,
+	
+#ifdef HAVE_CURSES
+	.proc_wlogprint_status = bitfury_wlogprint_status,
+	.proc_tui_wlogprint_choices = bitfury_tui_wlogprint_choices,
+	.proc_tui_handle_choice = bitfury_tui_handle_choice,
+#endif
 };

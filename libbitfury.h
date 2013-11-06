@@ -1,8 +1,13 @@
 #ifndef __LIBBITFURY_H__
 #define __LIBBITFURY_H__
 
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "miner.h"
 #include "spidevc.h"
+
+struct work;
 
 #define BITFURY_STAT_N 1024
 
@@ -15,6 +20,17 @@ struct bitfury_payload {
 	unsigned nnonce;
 };
 
+struct freq_stat {
+	double *mh;
+	double *s;
+	int osc6_min;
+	int osc6_max;
+	double omh;
+	double os;
+	int best_osc;
+	int best_done;
+};
+
 struct bitfury_device {
 	struct spi_port *spi;
 	unsigned char osc6_bits;
@@ -22,53 +38,27 @@ struct bitfury_device {
 	unsigned oldbuf[17];
 	bool oldjob;
 	int active;
-	struct work * work;
-	struct work * owork;
-	struct work * o2work;
-	int job_switched;
 	uint32_t atrvec[20];
 	struct bitfury_payload payload;
-	struct bitfury_payload opayload;
-	struct bitfury_payload o2payload;
-	unsigned int results[16];
-	int results_n;
-	time_t stat_ts[BITFURY_STAT_N];
-	unsigned int stat_counter;
-	unsigned int future_nonce;
-	unsigned int old_nonce;
+	struct freq_stat chip_stat;
 	struct timeval timer1;
-	struct timeval timer2;
-	struct timeval otimer1;
-	struct timeval otimer2;
-	struct timeval predict1;
-	struct timeval predict2;
+	struct timeval tv_stat;
 	unsigned int counter1, counter2;
-	unsigned int ocounter1, ocounter2;
-	int rate; //per msec
-	int osc_slow;
-	int osc_fast;
-	int req1_done, req2_done;
 	double mhz;
-	double ns;
 	unsigned slot;
 	unsigned fasync;
 	unsigned strange_counter;
-	bool second_run;
 	bool force_reinit;
 	int desync_counter;
 	int sample_hwe;
 	int sample_tot;
-	
-	time_t short_out_t;
-	time_t long_out_t;
 };
 
-extern void libbitfury_sendHashData1(int chip_id, struct bitfury_device *, struct thr_info *);
-void work_to_payload(struct bitfury_payload *p, struct work *w);
-extern void payload_to_atrvec(uint32_t *atrvec, struct bitfury_payload *);
-extern void send_reinit(struct spi_port *, int slot, int chip_n, int n);
-extern void send_shutdown(struct spi_port *, int slot, int chip_n);
-extern void send_freq(struct spi_port *, int slot, int chip_n, int bits);
+extern void work_to_bitfury_payload(struct bitfury_payload *, struct work *);
+extern void bitfury_payload_to_atrvec(uint32_t *atrvec, struct bitfury_payload *);
+extern void bitfury_send_reinit(struct spi_port *, int slot, int chip_n, int n);
+extern void bitfury_send_shutdown(struct spi_port *, int slot, int chip_n);
+extern void bitfury_send_freq(struct spi_port *, int slot, int chip_n, int bits);
 extern int libbitfury_detectChips1(struct spi_port *);
 extern unsigned bitfury_decnonce(unsigned);
 extern bool bitfury_fudge_nonce(const void *midstate, const uint32_t m7, const uint32_t ntime, const uint32_t nbits, uint32_t *nonce_p);

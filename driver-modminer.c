@@ -12,6 +12,8 @@
 
 #include <limits.h>
 #include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <unistd.h>
 
@@ -46,7 +48,7 @@
 
 #define FPGAID_ALL 4
 
-struct device_drv modminer_drv;
+BFG_REGISTER_DRIVER(modminer_drv)
 
 struct modminer_fpga_state {
 	bool work_running;
@@ -173,7 +175,7 @@ modminer_detect()
 static bool
 modminer_reopen(struct cgpu_info*modminer)
 {
-	close(modminer->device->device_fd);
+	serial_close(modminer->device->device_fd);
 	int fd = serial_open(modminer->device_path, 0, 10, true);
 	if (unlikely(-1 == fd)) {
 		applog(LOG_ERR, "%s: Failed to reopen %s", modminer->dev_repr, modminer->device_path);

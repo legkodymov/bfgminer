@@ -13,6 +13,8 @@
 
 #include "config.h"
 
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <ctype.h>
@@ -434,7 +436,7 @@ void json_rpc_call_async(CURL *curl, const char *url,
 		curl_easy_setopt(curl, CURLOPT_PROXY, pool->rpc_proxy);
 	} else if (opt_socks_proxy) {
 		curl_easy_setopt(curl, CURLOPT_PROXY, opt_socks_proxy);
-		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS4);
+		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5);
 	}
 	if (userpass) {
 		curl_easy_setopt(curl, CURLOPT_USERPWD, userpass);
@@ -720,6 +722,20 @@ badchar:
 	}
 	
 	return likely(!hexstr[0]);
+}
+
+void ucs2tochar(char * const out, const uint16_t * const in, const size_t sz)
+{
+	for (int i = 0; i < sz; ++i)
+		out[i] = in[i];
+}
+
+char *ucs2tochar_dup(uint16_t * const in, const size_t sz)
+{
+	char *out = malloc(sz + 1);
+	ucs2tochar(out, in, sz);
+	out[sz] = '\0';
+	return out;
 }
 
 void hash_data(unsigned char *out_hash, const unsigned char *data)
@@ -1366,7 +1382,7 @@ double tdiff(struct timeval *end, struct timeval *start)
 	return end->tv_sec - start->tv_sec + (end->tv_usec - start->tv_usec) / 1000000.0;
 }
 
-bool extract_sockaddr(struct pool *pool, char *url)
+bool extract_sockaddr(char *url, char **sockaddr_url, char **sockaddr_port)
 {
 	char *url_begin, *url_end, *ipv6_begin, *ipv6_end, *port_start = NULL;
 	char url_address[256], port[6];
@@ -1399,15 +1415,20 @@ bool extract_sockaddr(struct pool *pool, char *url)
 
 	sprintf(url_address, "%.*s", url_len, url_begin);
 
-	if (port_len)
+	if (port_len) {
+		char *slash;
+
 		snprintf(port, 6, "%.*s", port_len, port_start);
-	else
+		slash = strchr(port, '/');
+		if (slash)
+			*slash = '\0';
+	} else
 		strcpy(port, "80");
 
-	free(pool->stratum_port);
-	pool->stratum_port = strdup(port);
-	free(pool->sockaddr_url);
-	pool->sockaddr_url = strdup(url_address);
+	free(*sockaddr_port);
+	*sockaddr_port = strdup(port);
+	free(*sockaddr_url);
+	*sockaddr_url = strdup(url_address);
 
 	return true;
 }
@@ -1854,7 +1875,7 @@ static bool parse_reconnect(struct pool *pool, json_t *val)
 
 	snprintf(address, sizeof(address), "%s:%s", url, port);
 
-	if (!extract_sockaddr(pool, address))
+	if (!extract_sockaddr(address, &pool->sockaddr_url, &pool->stratum_port))
 		return false;
 
 	pool->stratum_url = pool->sockaddr_url;
@@ -2110,7 +2131,7 @@ static bool setup_stratum_curl(struct pool *pool)
 		curl_easy_setopt(curl, CURLOPT_PROXY, pool->rpc_proxy);
 	} else if (opt_socks_proxy) {
 		curl_easy_setopt(curl, CURLOPT_PROXY, opt_socks_proxy);
-		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS4);
+		curl_easy_setopt(curl, CURLOPT_PROXYTYPE, CURLPROXY_SOCKS5);
 	}
 	curl_easy_setopt(curl, CURLOPT_CONNECT_ONLY, 1);
 	pool->sock = INVSOCK;
@@ -2564,9 +2585,10 @@ const char *bfg_strerror(int e, enum bfg_strerror_type type)
 #endif
 			break;
 		case BST_SOCKET:
+		case BST_SYSTEM:
 		{
 #ifdef WIN32
-			// Windows has a different namespace for socket errors
+			// Windows has a different namespace for system and socket errors
 			LPSTR *msg = &bfgtls->bfg_strerror_socketresult;
 			if (*msg)
 				LocalFree(*msg);

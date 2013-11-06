@@ -13,6 +13,7 @@
 #include <ctype.h>
 #include <limits.h>
 #include <pthread.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <strings.h>
@@ -60,8 +61,8 @@ static const char *protonames[] = {
 	"parallel queue",
 };
 
-struct device_drv bitforce_drv;
-struct device_drv bitforce_queue_api;
+BFG_REGISTER_DRIVER(bitforce_drv)
+BFG_REGISTER_DRIVER(bitforce_queue_api)
 
 // Code must deal with a timeout
 #define BFopen(devpath)  serial_open(devpath, 0, 250, true)
@@ -144,7 +145,7 @@ void bitforce_cmd2(int fd, int procid, void *buf, size_t bufsz, const char *cmd,
 	BFgets(buf, bufsz, fd);
 }
 
-#define BFclose(fd) close(fd)
+#define BFclose(fd) serial_close(fd)
 
 struct bitforce_init_data {
 	bool sc;
@@ -185,6 +186,7 @@ static bool bitforce_detect_one(const char *devpath)
 	bitforce_cmd1(fdDev, 0, pdevbuf, sizeof(pdevbuf), "ZGX");
 	if (unlikely(!pdevbuf[0])) {
 		applog(LOG_DEBUG, "BFL: Error reading/timeout (ZGX)");
+		BFclose(fdDev);
 		return 0;
 	}
 
@@ -319,6 +321,7 @@ struct bitforce_data {
 	int queued_max;
 	int parallel;
 	bool parallel_protocol;
+	bool missing_zwx;
 	bool already_have_results;
 	bool just_flushed;
 	int ready_to_queue;
@@ -1634,8 +1637,12 @@ bool bitforce_send_queue(struct thr_info *thr)
 		*(--qjs) = 45;
 	}
 	
+retry:
 	mutex_lock(mutexp);
-	bitforce_cmd2(fd, data->xlink_id, buf, sizeof(buf), "ZWX", qjp, qjp_sz);
+	if (data->missing_zwx)
+		bitforce_cmd2(fd, data->xlink_id, buf, sizeof(buf), "ZNX", &qjp[3], qjp_sz - 4);
+	else
+		bitforce_cmd2(fd, data->xlink_id, buf, sizeof(buf), "ZWX", qjp, qjp_sz);
 	mutex_unlock(mutexp);
 	
 	if (!strncasecmp(buf, "ERR:QUEUE", 9))
@@ -1649,7 +1656,13 @@ bool bitforce_send_queue(struct thr_info *thr)
 	}
 	if (strncasecmp(buf, "OK:QUEUED", 9))
 	{
-		// TODO: ERR:UNKNOWN COMMAND
+		if ((!strncasecmp(buf, "ERROR: UNKNOWN", 11)) && !data->missing_zwx)
+		{
+			applog(LOG_DEBUG, "%"PRIpreprv": Missing ZWX command, trying ZNX",
+			       bitforce->proc_repr);
+			data->missing_zwx = true;
+			goto retry;
+		}
 		applog(LOG_DEBUG, "%"PRIpreprv": Unexpected error attempting to append %d jobs (queued<=%d): %s",
 	           bitforce->proc_repr,
 	           data->ready_to_queue, data->queued, buf);
@@ -1659,13 +1672,17 @@ bool bitforce_send_queue(struct thr_info *thr)
 	if (!data->queued)
 		cgtime(&data->tv_hashmeter_start);
 	
-	queued_ok = atoi(&buf[9]);
+	if (data->missing_zwx)
+		queued_ok = 1;
+	else
+		queued_ok = atoi(&buf[9]);
 	data->queued += queued_ok;
 	applog(LOG_DEBUG, "%"PRIpreprv": Successfully queued %d/%d jobs on device (queued<=%d)",
 	       bitforce->proc_repr,
 	       queued_ok, data->ready_to_queue, data->queued);
 	data->ready_to_queue -= queued_ok;
-	thr->queue_full = data->ready_to_queue;
+	if (!data->missing_zwx)
+		thr->queue_full = data->ready_to_queue;
 	data->just_flushed = false;
 	data->want_to_send_queue = false;
 	
@@ -1870,6 +1887,7 @@ bool bitforce_queue_append(struct thr_info *thr, struct work *work)
 	 || (data->ready_to_queue >= BITFORCE_MAX_BQUEUE_AT_ONCE)  // ...or 5 items ready to go
 	 || (thr->queue_full)            // ...or done filling queue
 	 || (data->just_flushed)         // ...or queue was just flushed (only remaining job is partly done already)
+	 || (data->missing_zwx)          // ...or device can only queue one at a time
 	)
 	{
 		if (!bitforce_send_queue(thr))
@@ -1916,6 +1934,13 @@ void bitforce_queue_flush(struct thr_info *thr)
 	{
 		flushed = atoi(&buf2[8]);
 		buf2 = next_line(buf2);
+	}
+	else
+	if (!strncasecmp(buf, "OK", 2))
+	{
+		applog(LOG_DEBUG, "%"PRIpreprv": Didn't report flush count", bitforce->proc_repr);
+		thr->queue_full = false;
+		flushed = 0;
 	}
 	else
 	{
@@ -2032,7 +2057,9 @@ static void bitforce_queue_thread_deven(struct thr_info *thr)
 	struct bitforce_data *data = bitforce->device_data;
 	struct thr_info *thisthr;
 	
-	for (thisbf = bitforce; thisbf && thisbf->device_data == data; thisbf = thisbf->next_proc)
+	for (thisbf = bitforce->device; thisbf && thisbf->device_data != data; thisbf = thisbf->next_proc)
+	{}
+	for ( ; thisbf && thisbf->device_data == data; thisbf = thisbf->next_proc)
 	{
 		thisthr = bitforce->thr[0];
 		

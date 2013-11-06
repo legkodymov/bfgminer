@@ -13,7 +13,7 @@ dnl * any later version.  See COPYING for more details.
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_maj], [3])
-m4_define([v_min], [3])
+m4_define([v_min], [5])
 m4_define([v_mic], [0])
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_ver], [v_maj.v_min.v_mic])
@@ -31,7 +31,7 @@ AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([miner.c])
 AC_CONFIG_HEADERS([config.h])
 
-AM_INIT_AUTOMAKE([foreign])
+AM_INIT_AUTOMAKE([foreign subdir-objects])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
 AC_USE_SYSTEM_EXTENSIONS
 
@@ -67,6 +67,8 @@ AC_PROG_CPP
 
 gl_INIT
 
+AC_SYS_LARGEFILE
+
 dnl Checks for header files.
 AC_HEADER_STDC
 AC_CHECK_HEADERS(syslog.h)
@@ -76,6 +78,24 @@ AC_CHECK_HEADERS([sys/file.h])
 AC_CHECK_HEADERS([linux/spi/spidev.h])
 
 AC_CHECK_HEADERS([sys/file.h])
+
+AC_CHECK_MEMBER([struct i2c_msg.buf],[
+	true
+],[
+	dnl Note the member is different here to avoid caching screwing things up
+	AC_CHECK_MEMBER([struct i2c_msg.len],[
+		AC_DEFINE([NEED_LINUX_I2C_H],[1],[Defined if linux/i2c.h is needed to supplement linux/i2c-dev.h])
+	],[
+		true
+	],[
+		AC_INCLUDES_DEFAULT
+		#include <linux/i2c.h>
+		#include <linux/i2c-dev.h>
+	])
+],[
+	AC_INCLUDES_DEFAULT
+	#include <linux/i2c-dev.h>
+])
 
 # Setuid
 AC_CHECK_HEADERS([pwd.h])
@@ -91,9 +111,13 @@ optlist=
 
 need_dynclock=no
 need_fpgautils=no
+need_lowlevel=no
+need_lowl_hid=no
 have_cygwin=false
 have_win32=false
 have_macho=false
+AUTOSCAN_CPPFLAGS=""
+AUTOSCAN_LIBS=""
 DLOPEN_FLAGS="-ldl"
 WS2_LIBS=""
 MM_LIBS=""
@@ -362,6 +386,31 @@ if test "x$avalon" = xyes; then
 fi
 AM_CONDITIONAL([HAS_AVALON], [test x$avalon = xyes])
 
+driverlist="$driverlist knc"
+AC_ARG_ENABLE([knc],
+	[AC_HELP_STRING([--enable-knc],[Compile support for KnC (default disabled)])],
+	[knc=$enableval],
+	[knc=no]
+	)
+if test "x$knc" = xyes; then
+	AC_CHECK_HEADERS([linux/i2c-dev-user.h])
+	AC_CHECK_DECL([i2c_smbus_read_word_data],[true],[
+		AC_MSG_ERROR([linux/i2c-dev.h header from i2c-tools (NOT linux headers) is required for knc driver])
+	],[
+		#include <stddef.h>
+		#ifdef HAVE_LINUX_I2C_DEV_USER_H
+		#include <linux/i2c-dev-user.h>
+		#else
+		#ifdef NEED_LINUX_I2C_H
+		#include <linux/i2c.h>
+		#endif
+		#include <linux/i2c-dev.h>
+		#endif
+	])
+	AC_DEFINE([USE_KNC], [1], [Defined to 1 if KnC support is wanted])
+fi
+AM_CONDITIONAL([USE_KNC], [test x$knc = xyes])
+
 httpsrv=auto
 AC_ARG_WITH([libmicrohttpd],
 	[AC_HELP_STRING([--without-libmicrohttpd],[Compile support for libmicrohttpd getwork server (default enabled)])],
@@ -482,6 +531,7 @@ if test "x$x6500" = xyes; then
 	AC_DEFINE([USE_X6500], [1], [Defined to 1 if X6500 support is wanted])
 	need_dynclock=yes
 	need_fpgautils=yes
+	need_lowlevel=yes
 fi
 AM_CONDITIONAL([HAS_X6500], [test x$x6500 = xyes])
 
@@ -579,6 +629,83 @@ fi
 AM_CONDITIONAL([HAS_LITTLEFURY], [test x$littlefury = xyes])
 
 
+found_hidapi=false
+for _hidapi_lib in hidapi hidapi-hidraw hidapi-libusb; do
+	PKG_CHECK_MODULES([hidapi],[$_hidapi_lib],[
+		found_hidapi=true
+		break
+	],[
+		true
+	])
+done
+
+
+driverlist="$driverlist nanofury"
+nanofury=auto
+AC_ARG_ENABLE([nanofury],
+	[AC_HELP_STRING([--disable-nanofury],[Compile support for NanoFury (default enabled)])],
+	[nanofury=$enableval]
+	)
+if test "x$nanofury" = "xno"; then
+	true
+elif test "x$bitfury" = "xyes"; then
+	if test x$found_hidapi = xtrue; then
+		nanofury=yes
+	else
+		if test x$nanofury = xauto; then
+			nanofury=no
+			nanofury_enableaction="install hidapi"
+		else
+			AC_MSG_ERROR([Could not find hidapi, required for NanoFury support])
+		fi
+	fi
+elif test "x$nanofury" = "xyes"; then
+	AC_MSG_ERROR([You explicitly disabled Bitfury and explicitly enabled NanoFury])
+else
+	nanofury=no
+fi
+if test "x$nanofury" = "xyes"; then
+	AC_DEFINE([USE_NANOFURY], [1], [Defined to 1 if NanoFury support is wanted])
+	need_fpgautils=yes
+	need_lowlevel=yes
+	need_lowl_hid=yes
+fi
+AM_CONDITIONAL([HAS_NANOFURY], [test x$nanofury = xyes])
+
+
+driverlist="$driverlist hashbuster"
+hashbuster=auto
+AC_ARG_ENABLE([hashbuster],
+	[AC_HELP_STRING([--disable-hashbuster],[Compile support for HashBuster (default enabled)])],
+	[hashbuster=$enableval]
+	)
+if test "x$hashbuster" = "xno"; then
+	true
+elif test "x$bitfury" = "xyes"; then
+	if test x$found_hidapi = xtrue; then
+		hashbuster=yes
+	else
+		if test x$hashbuster = xauto; then
+			hashbuster=no
+			hashbuster_enableaction="install hidapi"
+		else
+			AC_MSG_ERROR([Could not find hidapi, required for HashBuster support])
+		fi
+	fi
+elif test "x$hashbuster" = "xyes"; then
+	AC_MSG_ERROR([You explicitly disabled Bitfury and explicitly enabled HashBuster])
+else
+	hashbuster=no
+fi
+if test "x$hashbuster" = "xyes"; then
+	AC_DEFINE([USE_HASHBUSTER], [1], [Defined to 1 if HashBuster support is wanted])
+	need_fpgautils=yes
+	need_lowlevel=yes
+	need_lowl_hid=yes
+fi
+AM_CONDITIONAL([USE_HASHBUSTER], [test x$hashbuster = xyes])
+
+
 driverlist="$driverlist metabank"
 metabank=no
 AC_ARG_ENABLE([metabank],
@@ -622,9 +749,34 @@ fi
 
 if test x$need_fpgautils = xyes; then
 	AC_DEFINE([HAVE_FPGAUTILS], [1], [Defined to 1 if fpgautils is being used])
+	need_lowlevel=yes
 	
 	if $have_win32; then
 		echo '#include <iospeeds.h>' >iospeeds_local.h
+		
+		found_ddkusb=false
+		AC_CHECK_HEADER([usbiodef.h],[
+			found_ddkusb=true
+		],[
+			AC_CHECK_HEADER([ddk/usbiodef.h],[
+				found_ddkusb=true
+				AUTOSCAN_CPPFLAGS="-I"`echo '#include <ddk/usbiodef.h>' | ${CPP} -M - 2>/dev/null | tr -d '\\n\\r\\\\' | sed -e 's/^.*[[:space:]:]\(\/[^[:space:]]*\)usbiodef\.h[[:space:]].*$/\1/' -e t -e d`
+			],[
+				true
+			],[
+				#include <windows.h>
+				#include <ddk/usbioctl.h>
+				AC_INCLUDES_DEFAULT
+			])
+		],[
+			#include <windows.h>
+			#include <usbioctl.h>
+			AC_INCLUDES_DEFAULT
+		])
+		if $found_ddkusb; then
+			AUTOSCAN_LIBS="-lsetupapi"
+			AC_DEFINE([HAVE_WIN_DDKUSB],[1],[Defined to 1 if Windows DDK USB headers are being used])
+		fi
 	else
 		AC_MSG_CHECKING([what baud rates your system supports])
 		echo '#include <termios.h>' | ${CPP} -dM - 2>/dev/null | sed 's/.*[ 	]B\([0-9][0-9]*\)[ 	].*/IOSPEED(\1)/' | grep IOSPEED >iospeeds_local.h
@@ -635,6 +787,15 @@ if test x$need_fpgautils = xyes; then
 			echo '#include <iospeeds_posix.h>' >iospeeds_local.h
 		fi
 	fi
+fi
+
+if test x$need_lowl_hid = xyes; then
+	AC_DEFINE([NEED_BFG_LOWL_HID], [1], [Defined to 1 if lowlevel hid drivers are being used])
+	need_lowlevel=yes
+fi
+
+if test x$need_lowlevel = xyes; then
+	AC_DEFINE([HAVE_BFG_LOWLEVEL], [1], [Defined to 1 if lowlevel drivers are being used])
 fi
 
 
@@ -790,12 +951,16 @@ AC_SUBST(libblkmaker_LIBS)
 AM_CONDITIONAL([NEED_LIBBLKMAKER], [test x$with_system_libblkmaker != xyes])
 AM_CONDITIONAL([NEED_DYNCLOCK], [test x$need_dynclock = xyes])
 AM_CONDITIONAL([NEED_FPGAUTILS], [test x$need_fpgautils = xyes])
+AM_CONDITIONAL([NEED_BFG_LOWL_HID], [test x$need_lowl_hid = xyes])
+AM_CONDITIONAL([NEED_BFG_LOWLEVEL], [test x$need_lowlevel = xyes])
 AM_CONDITIONAL([HAS_SCRYPT], [test x$scrypt = xyes])
 AM_CONDITIONAL([HAVE_CURSES], [test x$curses = xyes])
 AM_CONDITIONAL([HAVE_SENSORS], [test x$with_sensors = xyes])
 AM_CONDITIONAL([HAVE_CYGWIN], [test x$have_cygwin = xtrue])
+AM_CONDITIONAL([HAVE_LIBUSB], [test x$libusb = xyes])
 AM_CONDITIONAL([HAVE_WINDOWS], [test x$have_win32 = xtrue])
 AM_CONDITIONAL([HAVE_x86_64], [test x$have_x86_64 = xtrue])
+AM_CONDITIONAL([HAVE_WIN_DDKUSB], [test x$found_ddkusb = xtrue])
 AM_CONDITIONAL([HAS_FPGA], [test x$bitforce$icarus$modminer$x6500$ztex != xnonononono])
 AM_CONDITIONAL([HAS_ASIC], [test x$avalon$bfsb$bigpic$icarus$httpsrv$metabank != xnononononono])
 
@@ -1127,6 +1292,8 @@ AC_DEFINE_UNQUOTED([DIABLO_KERNNAME], ["diablo130302"], [Filename for diablo ker
 AC_DEFINE_UNQUOTED([SCRYPT_KERNNAME], ["scrypt130511"], [Filename for scrypt kernel])
 
 
+AC_SUBST(AUTOSCAN_CPPFLAGS)
+AC_SUBST(AUTOSCAN_LIBS)
 AC_SUBST(PTHREAD_FLAGS)
 AC_SUBST(DLOPEN_FLAGS)
 AC_SUBST(PTHREAD_LIBS)
@@ -1148,7 +1315,6 @@ AC_CONFIG_FILES([
 	ccan/Makefile
 	lib/Makefile
 	])
-AC_OUTPUT
 
 
 echo
@@ -1186,6 +1352,7 @@ EOF
 	done
 	_yeslist=`echo "$_yeslist" | tr ' ' '\n' | sort | tr '\n' ' '`
 	_nolist=`echo "$_nolist" | tr ' ' '\n' | sort | tr '\n' ' '`
+	AC_DEFINE_UNQUOTED(AS_TR_CPP([BFG_$2]),["$_yeslist"],[List of drivers being built])
 	echo "  Enabled..$1..:$_yeslist"
 	echo "  Disabled.$1..:$_nolist"
 	if test -n "$_enableactions"; then
@@ -1199,10 +1366,11 @@ BFG_PRINT_LIST([Options...],[optlist])
 
 echo
 echo "Compilation............: make (or gmake)"
-echo "  CFLAGS...............: $CPPFLAGS $NCURSES_CPPFLAGS $PTHREAD_FLAGS $CFLAGS $LIBUSB_CFLAGS $JANSSON_CFLAGS $PTHREAD_FLAGS $libblkmaker_CFLAGS"
-echo "  LDFLAGS..............: $LDFLAGS $PTHREAD_FLAGS $libblkmaker_LDFLAGS $PTHREAD_LIBS $LIBS $DLOPEN_FLAGS $LIBCURL_LIBS $JANSSON_LIBS $NCURSES_LIBS $PDCURSES_LIBS $WS2_LIBS $MATH_LIBS $UDEV_LIBS $LIBUSB_LIBS $RT_LIBS $sensors_LIBS $libblkmaker_LIBS"
+echo "  CFLAGS...............: $CPPFLAGS $AUTOSCAN_CPPFLAGS $NCURSES_CPPFLAGS $PTHREAD_FLAGS $CFLAGS $LIBUSB_CFLAGS $JANSSON_CFLAGS $PTHREAD_FLAGS $libblkmaker_CFLAGS $hidapi_CFLAGS"
+echo "  LDFLAGS..............: $LDFLAGS $AUTOSCAN_LIBS $PTHREAD_FLAGS $libblkmaker_LDFLAGS $PTHREAD_LIBS $LIBS $DLOPEN_FLAGS $LIBCURL_LIBS $JANSSON_LIBS $NCURSES_LIBS $PDCURSES_LIBS $WS2_LIBS $MATH_LIBS $UDEV_LIBS $LIBUSB_LIBS $RT_LIBS $sensors_LIBS $libblkmaker_LIBS"
 echo
 echo "Installation...........: make install$maybe_ldconfig #(as root if needed, with 'su' or 'sudo')"
 echo "  prefix...............: $prefix"
 echo
 
+AC_OUTPUT

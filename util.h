@@ -14,6 +14,7 @@
 #define __UTIL_H__
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <string.h>
 #include <sys/time.h>
 
@@ -112,6 +113,14 @@ extern json_t *json_rpc_call_completed(CURL *, int rc, bool probe, int *rolltime
 
 extern char *absolute_uri(char *uri, const char *ref);  // ref must be a root URI
 
+extern void ucs2tochar(char *out, const uint16_t *in, size_t sz);
+extern char *ucs2tochar_dup(uint16_t *in, size_t sz);
+
+#define BFGINIT(var, val)  do{  \
+	if (!(var))       \
+		(var) = val;  \
+}while(0)
+
 extern void gen_hash(unsigned char *data, unsigned char *hash, int len);
 extern void hash_data(unsigned char *out_hash, const unsigned char *data);
 extern void real_block_target(unsigned char *target, const unsigned char *data);
@@ -153,7 +162,7 @@ bool _stratum_send(struct pool *pool, char *s, ssize_t len, bool force);
 bool sock_full(struct pool *pool);
 char *recv_line(struct pool *pool);
 bool parse_method(struct pool *pool, char *s);
-bool extract_sockaddr(struct pool *pool, char *url);
+bool extract_sockaddr(char *url, char **sockaddr_url, char **sockaddr_port);
 bool auth_stratum(struct pool *pool);
 bool initiate_stratum(struct pool *pool);
 bool restart_stratum(struct pool *pool);
@@ -168,6 +177,7 @@ enum bfg_strerror_type {
 	BST_ERRNO,
 	BST_SOCKET,
 	BST_LIBUSB,
+	BST_SYSTEM,
 };
 extern const char *bfg_strerror(int, enum bfg_strerror_type);
 

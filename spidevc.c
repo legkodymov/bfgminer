@@ -47,8 +47,6 @@
 #include <linux/spi/spidev.h>
 #include <time.h>
 #include <unistd.h>
-#include <linux/i2c.h>
-#include <linux/i2c-dev.h>
 #include <sys/stat.h>
 #endif
 
@@ -220,8 +218,7 @@ void *spi_emit_buf_reverse(struct spi_port *port, const void *p, size_t sz)
 	return rv;
 }
 
-static
-void spi_emit_buf(struct spi_port *port, void *str, size_t sz)
+void spi_emit_buf(struct spi_port * const port, const void * const str, const size_t sz)
 {
 	if (port->spibufsz + sz >= SPIMAXSZ)
 		return;
@@ -250,7 +247,7 @@ void spi_emit_fasync(struct spi_port *port, int n)
 
 void spi_emit_nop(struct spi_port *port, int n) {
 	int i;
-	for (i = 0; i < n; n++) {
+	for (i = 0; i < n; ++i) {
 		spi_emit_buf(port, "\x0", 1);
 	}
 }

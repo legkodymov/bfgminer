@@ -7,6 +7,11 @@
  * any later version.  See COPYING for more details.
  */
 
+#include "config.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "compat.h"
 #include "dynclock.h"
 #include "fpgautils.h"
@@ -22,9 +27,7 @@
 #define CAIRNSMORE1_DEFAULT_CLOCK  200
 #define CAIRNSMORE1_MAXIMUM_CLOCK  210
 
-struct device_drv cairnsmore_drv;
-
-static void cairnsmore_drv_init();
+BFG_REGISTER_DRIVER(cairnsmore_drv)
 
 static bool cairnsmore_detect_one(const char *devpath)
 {
@@ -54,7 +57,6 @@ static int cairnsmore_detect_auto(void)
 
 static void cairnsmore_detect()
 {
-	cairnsmore_drv_init();
 	// Actual serial detection is handled by Icarus driver
 	serial_detect_auto_byname(&cairnsmore_drv, cairnsmore_detect_one, cairnsmore_detect_auto);
 }
@@ -97,7 +99,7 @@ bool cairnsmore_supports_dynclock(int fd)
 			// Hashed the command, so it's not supported
 			return false;
 		default:
-			applog(LOG_WARNING, "Unexpected nonce from dynclock probe: %08x", be32toh(nonce));
+			applog(LOG_WARNING, "Unexpected nonce from dynclock probe: %08x", (uint32_t)be32toh(nonce));
 			return false;
 		case 0:
 			return true;
@@ -206,9 +208,9 @@ static void cairnsmore_drv_init()
 	cairnsmore_drv.thread_init = cairnsmore_init;
 	cairnsmore_drv.identify_device = cairnsmore_identify;
 	cairnsmore_drv.get_api_extra_device_status = cairnsmore_drv_extra_device_status;
+	++cairnsmore_drv.probe_priority;
 }
 
 struct device_drv cairnsmore_drv = {
-	// Needed to get to cairnsmore_drv_init at all
-	.drv_detect = cairnsmore_detect,
+	.drv_init = cairnsmore_drv_init,
 };

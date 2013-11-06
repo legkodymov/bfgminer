@@ -24,135 +24,45 @@
 #include "fpgautils.h"
 #include "ft232r.h"
 #include "logging.h"
+#include "lowlevel.h"
 #include "miner.h"
 
 #define FT232R_IDVENDOR   0x0403
 #define FT232R_IDPRODUCT  0x6001
 
-struct ft232r_device_info {
-	libusb_device *libusb_dev;
-	char *product;
-	char *serial;
-};
-
-static struct ft232r_device_info **ft232r_devinfo_list;
-
-void ft232r_scan_free()
+static
+void ft232r_devinfo_free(struct lowlevel_device_info * const info)
 {
-	if (!ft232r_devinfo_list)
-		return;
-
-	struct ft232r_device_info *info;
-
-	for (struct ft232r_device_info **infop = ft232r_devinfo_list; (info = *infop); ++infop) {
-		libusb_unref_device(info->libusb_dev);
-		free(info->product);
-		free(info->serial);
-		free(info);
-	}
-	free(ft232r_devinfo_list);
-	ft232r_devinfo_list = NULL;
+	libusb_device * const dev = info->lowl_data;
+	if (dev)
+		libusb_unref_device(dev);
 }
 
-void ft232r_scan()
+static
+bool _ft232r_devinfo_scan_cb(struct lowlevel_device_info * const usbinfo, void * const userp)
 {
-	ssize_t count, n, i, found = 0;
-	libusb_device **list;
-	struct libusb_device_descriptor desc;
-	libusb_device_handle *handle;
-	struct ft232r_device_info *info;
-	int err;
-	unsigned char buf[0x100];
-	int skipped = 0;
-
-	ft232r_scan_free();
-
-	count = libusb_get_device_list(NULL, &list);
-	if (unlikely(count < 0)) {
-		applog(LOG_ERR, "ft232r_scan: Error getting USB device list: %s", bfg_strerror(count, BST_LIBUSB));
-		ft232r_devinfo_list = calloc(1, sizeof(struct ft232r_device_info *));
-		return;
-	}
-
-	ft232r_devinfo_list = malloc(sizeof(struct ft232r_device_info *) * (count + 1));
-
-	for (i = 0; i < count; ++i) {
-		if (bfg_claim_libusb(NULL, false, list[i]))
-		{
-			++skipped;
-			continue;
-		}
-		
-		err = libusb_get_device_descriptor(list[i], &desc);
-		if (unlikely(err)) {
-			applog(LOG_ERR, "ft232r_scan: Error getting device descriptor: %s", bfg_strerror(err, BST_LIBUSB));
-			continue;
-		}
-		if (!(desc.idVendor == FT232R_IDVENDOR && desc.idProduct == FT232R_IDPRODUCT)) {
-			applog(LOG_DEBUG, "ft232r_scan: Found %04x:%04x - not a ft232r", desc.idVendor, desc.idProduct);
-			continue;
-		}
-
-		err = libusb_open(list[i], &handle);
-		if (unlikely(err)) {
-			applog(LOG_ERR, "ft232r_scan: Error opening device: %s", bfg_strerror(err, BST_LIBUSB));
-			continue;
-		}
-
-		n = libusb_get_string_descriptor_ascii(handle, desc.iProduct, buf, sizeof(buf)-1);
-		if (unlikely(n < 0)) {
-			libusb_close(handle);
-			applog(LOG_ERR, "ft232r_scan: Error getting iProduct string: %s", bfg_strerror(n, BST_LIBUSB));
-			continue;
-		}
-		buf[n] = '\0';
-		info = malloc(sizeof(struct ft232r_device_info));
-		info->product = strdup((char*)buf);
-
-		n = libusb_get_string_descriptor_ascii(handle, desc.iSerialNumber, buf, sizeof(buf)-1);
-		libusb_close(handle);
-		if (unlikely(n < 0)) {
-			applog(LOG_ERR, "ft232r_scan: Error getting iSerialNumber string: %s", bfg_strerror(n, BST_LIBUSB));
-			n = 0;
-		}
-		buf[n] = '\0';
-		info->serial = strdup((char*)buf);
-		info->libusb_dev = libusb_ref_device(list[i]);
-		ft232r_devinfo_list[found++] = info;
-
-		applog(LOG_DEBUG, "ft232r_scan: Found \"%s\" serial \"%s\"", info->product, info->serial);
-	}
-
-	ft232r_devinfo_list[found] = NULL;
-	libusb_free_device_list(list, 1);
+	struct lowlevel_device_info **devinfo_list_p = userp, *info;
 	
-	if (skipped)
-		applog(LOG_DEBUG, "%s: Skipping probe of %d claimed devices", __func__, skipped);
+	info = malloc(sizeof(*info));
+	*info = (struct lowlevel_device_info){
+		.lowl = &lowl_ft232r,
+		.lowl_data = libusb_ref_device(usbinfo->lowl_data),
+	};
+	lowlevel_devinfo_semicpy(info, usbinfo);
+	LL_PREPEND(*devinfo_list_p, info);
+	
+	// Never *consume* the lowl_usb entry - especially since this is during the scan!
+	return false;
 }
 
-int ft232r_detect(const char *product_needle, const char *serial, foundusb_func_t cb)
+static
+struct lowlevel_device_info *ft232r_devinfo_scan()
 {
-	struct ft232r_device_info *info;
-	int found = 0;
-
-	for (struct ft232r_device_info **infop = ft232r_devinfo_list; (info = *infop); ++infop) {
-		if (serial) {
-			// If we are searching for a specific serial, pay no attention to the product id
-			if (strcmp(serial, info->serial))
-				continue;
-		}
-		else
-		if (!strstr(info->product, product_needle))
-			continue;
-		if (!info->libusb_dev)
-			continue;
-		if (!cb(info->libusb_dev, info->product, info->serial))
-			continue;
-		info->libusb_dev = NULL;
-		++found;
-	}
-
-	return found;
+	struct lowlevel_device_info *devinfo_list = NULL;
+	
+	lowlevel_detect_id(_ft232r_devinfo_scan_cb, &devinfo_list, &lowl_usb, FT232R_IDVENDOR, FT232R_IDPRODUCT);
+	
+	return devinfo_list;
 }
 
 #define FTDI_REQTYPE  (LIBUSB_REQUEST_TYPE_VENDOR | LIBUSB_RECIPIENT_DEVICE)
@@ -181,8 +91,14 @@ struct ft232r_device_handle {
 	uint16_t obufsz;
 };
 
-struct ft232r_device_handle *ft232r_open(libusb_device *dev)
+struct ft232r_device_handle *ft232r_open(struct lowlevel_device_info *info)
 {
+	libusb_device * const dev = info->lowl_data;
+	info->lowl_data = NULL;
+	
+	if (!dev)
+		return NULL;
+	
 	// FIXME: Cleanup on errors
 	libusb_device_handle *devh;
 	struct ft232r_device_handle *ftdi;
@@ -407,6 +323,12 @@ bool ft232r_get_cbus_bits(struct ft232r_device_handle *dev, bool *out_sio0, bool
 	*out_sio1 = data & 2;
 	return true;
 }
+
+struct lowlevel_driver lowl_ft232r = {
+	.dname = "ft232r",
+	.devinfo_scan = ft232r_devinfo_scan,
+	.devinfo_free = ft232r_devinfo_free,
+};
 
 #if 0
 int main() {

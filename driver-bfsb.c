@@ -24,12 +24,14 @@
 
 #include "config.h"
 
+#include <stdbool.h>
+
 #include "deviceapi.h"
 #include "libbitfury.h"
 #include "spidevc.h"
 #include "driver-bitfury.h"
 
-struct device_drv bfsb_drv;
+BFG_REGISTER_DRIVER(bfsb_drv)
 
 static
 bool bfsb_spi_txrx(struct spi_port *port)
@@ -143,8 +145,9 @@ bool bfsb_init(struct thr_info *thr)
 		proc->device_data = bitfury;
 		bitfury->spi->cgpu = proc;
 		bitfury_init_chip(proc);
-		bitfury->osc6_bits = 54;
-		send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+		bitfury->osc6_bits = 53;
+		bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+		bitfury_init_freq_stat(&bitfury->chip_stat, 52, 56);
 		
 		if (proc->proc_id == proc->procs - 1)
 			free(devicelist);
@@ -154,29 +157,6 @@ bool bfsb_init(struct thr_info *thr)
 	
 	return true;
 }
-
-static
-void bfsb_disable(struct thr_info * const thr)
-{
-	struct cgpu_info * const proc = thr->cgpu;
-	struct bitfury_device * const bitfury = proc->device_data;
-	
-	applog(LOG_DEBUG, "%"PRIpreprv": Shutting down chip (disable)", proc->proc_repr);
-	send_shutdown(bitfury->spi, bitfury->slot, bitfury->fasync);
-}
-
-static
-void bfsb_enable(struct thr_info * const thr)
-{
-	struct cgpu_info * const proc = thr->cgpu;
-	struct bitfury_device * const bitfury = proc->device_data;
-	
-	applog(LOG_DEBUG, "%"PRIpreprv": Reinitialising chip (enable)", proc->proc_repr);
-	send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
-	bitfury_init_chip(proc);
-}
-
-extern void bitfury_shutdown(struct thr_info *);
 
 static void bfsb_shutdown(struct thr_info *thr)
 {
@@ -207,7 +187,13 @@ struct device_drv bfsb_drv = {
 	.get_api_extra_device_detail = bfsb_api_device_detail,
 	.get_api_extra_device_status = bitfury_api_device_status,
 	.set_device = bitfury_set_device,
-	.thread_disable = bfsb_disable,
-	.thread_enable = bfsb_enable,
+	.thread_disable = bitfury_disable,
+	.thread_enable = bitfury_enable,
 	.thread_shutdown = bfsb_shutdown,
+	
+#ifdef HAVE_CURSES
+	.proc_wlogprint_status = bitfury_wlogprint_status,
+	.proc_tui_wlogprint_choices = bitfury_tui_wlogprint_choices,
+	.proc_tui_handle_choice = bitfury_tui_handle_choice,
+#endif
 };

@@ -28,8 +28,59 @@
 #include "deviceapi.h"
 #include "fpgautils.h"
 #include "logging.h"
+#include "lowlevel.h"
 #include "miner.h"
 #include "util.h"
+
+struct driver_registration *_bfg_drvreg1;
+struct driver_registration *_bfg_drvreg2;
+
+void _bfg_register_driver(const struct device_drv *drv)
+{
+	static struct driver_registration *initlist;
+	struct driver_registration *ndr;
+	
+	if (!drv)
+	{
+		// Move initlist to hashtables
+		LL_FOREACH(initlist, ndr)
+		{
+			drv = ndr->drv;
+			if (drv->drv_init)
+				drv->drv_init();
+			HASH_ADD_KEYPTR(hh , _bfg_drvreg1, drv->dname, strlen(drv->dname), ndr);
+			HASH_ADD_KEYPTR(hh2, _bfg_drvreg2, drv->name , strlen(drv->name ), ndr);
+		}
+		initlist = NULL;
+		return;
+	}
+	
+	ndr = malloc(sizeof(*ndr));
+	*ndr = (struct driver_registration){
+		.drv = drv,
+	};
+	LL_PREPEND(initlist, ndr);
+}
+
+static
+int sort_drv_by_dname(struct driver_registration * const a, struct driver_registration * const b)
+{
+	return strcmp(a->drv->dname, b->drv->dname);
+};
+
+static
+int sort_drv_by_priority(struct driver_registration * const a, struct driver_registration * const b)
+{
+	return a->drv->probe_priority - b->drv->probe_priority;
+};
+
+void bfg_devapi_init()
+{
+	_bfg_register_driver(NULL);
+	HASH_SRT(hh , _bfg_drvreg1, sort_drv_by_dname   );
+	HASH_SRT(hh2, _bfg_drvreg2, sort_drv_by_priority);
+}
+
 
 bool hashes_done(struct thr_info *thr, int64_t hashes, struct timeval *tvp_hashes, uint32_t *max_nonce)
 {
@@ -168,6 +219,9 @@ void minerloop_scanhash(struct thr_info *mythr)
 	pthread_setcanceltype(PTHREAD_CANCEL_DEFERRED, NULL);
 #endif
 	
+	if (cgpu->deven != DEV_ENABLED)
+		mt_disable(mythr);
+	
 	while (likely(!cgpu->shutdown)) {
 		mythr->work_restart = false;
 		request_work(mythr);
@@ -284,13 +338,16 @@ void job_results_fetched(struct thr_info *mythr)
 	if (mythr->_proceed_with_new_job)
 		do_job_start(mythr);
 	else
-	if (likely(mythr->prev_work))
 	{
-		struct timeval tv_now;
-		
-		timer_set_now(&tv_now);
-		
-		do_process_results(mythr, &tv_now, mythr->prev_work, true);
+		if (likely(mythr->prev_work))
+		{
+			struct timeval tv_now;
+			
+			timer_set_now(&tv_now);
+			
+			do_process_results(mythr, &tv_now, mythr->prev_work, true);
+		}
+		mt_disable_start(mythr);
 	}
 }
 
@@ -406,6 +463,22 @@ void do_notifier_select(struct thr_info *thr, struct timeval *tvp_timeout)
 		notifier_read(thr->work_restart_notifier);
 }
 
+static
+void _minerloop_setup(struct thr_info *mythr)
+{
+	struct cgpu_info * const cgpu = mythr->cgpu, *proc;
+	
+	if (mythr->work_restart_notifier[1] == -1)
+		notifier_init(mythr->work_restart_notifier);
+	
+	for (proc = cgpu; proc; proc = proc->next_proc)
+	{
+		mythr = proc->thr[0];
+		timer_set_now(&mythr->tv_watchdog);
+		proc->disable_watchdog = true;
+	}
+}
+
 void minerloop_async(struct thr_info *mythr)
 {
 	struct thr_info *thr = mythr;
@@ -416,14 +489,7 @@ void minerloop_async(struct thr_info *mythr)
 	struct cgpu_info *proc;
 	bool is_running, should_be_running;
 	
-	if (mythr->work_restart_notifier[1] == -1)
-		notifier_init(mythr->work_restart_notifier);
-	for (proc = cgpu; proc; proc = proc->next_proc)
-	{
-		mythr = proc->thr[0];
-		timer_set_now(&mythr->tv_watchdog);
-		proc->disable_watchdog = true;
-	}
+	_minerloop_setup(mythr);
 	
 	while (likely(!cgpu->shutdown)) {
 		tv_timeout.tv_sec = -1;
@@ -451,15 +517,20 @@ void minerloop_async(struct thr_info *mythr)
 			}
 			else  // ! should_be_running
 			{
-				if (unlikely(is_running && !mythr->_job_transition_in_progress))
+				if (unlikely((is_running || !thr->_mt_disable_called) && !mythr->_job_transition_in_progress))
 				{
 disabled: ;
-					mythr->tv_morework.tv_sec = -1;
-					if (mythr->busy_state != TBS_GETTING_RESULTS)
-						do_get_results(mythr, false);
-					else
-						// Avoid starting job when pending result fetch completes
-						mythr->_proceed_with_new_job = false;
+					timer_unset(&mythr->tv_morework);
+					if (is_running)
+					{
+						if (mythr->busy_state != TBS_GETTING_RESULTS)
+							do_get_results(mythr, false);
+						else
+							// Avoid starting job when pending result fetch completes
+							mythr->_proceed_with_new_job = false;
+					}
+					else  // !thr->_mt_disable_called
+						mt_disable_start(mythr);
 				}
 			}
 			
@@ -514,8 +585,7 @@ void minerloop_queue(struct thr_info *thr)
 	bool should_be_running;
 	struct work *work;
 	
-	if (thr->work_restart_notifier[1] == -1)
-		notifier_init(thr->work_restart_notifier);
+	_minerloop_setup(thr);
 	
 	while (likely(!cgpu->shutdown)) {
 		tv_timeout.tv_sec = -1;
@@ -528,11 +598,8 @@ void minerloop_queue(struct thr_info *thr)
 redo:
 			if (should_be_running)
 			{
-				if (unlikely(!mythr->_last_sbr_state))
-				{
+				if (unlikely(mythr->_mt_disable_called))
 					mt_disable_finish(mythr);
-					mythr->_last_sbr_state = should_be_running;
-				}
 				
 				if (unlikely(mythr->work_restart))
 				{
@@ -560,20 +627,27 @@ redo:
 				}
 			}
 			else
-			if (unlikely(mythr->_last_sbr_state))
+			if (unlikely(!mythr->_mt_disable_called))
 			{
-				mythr->_last_sbr_state = should_be_running;
 				do_queue_flush(mythr);
+				mt_disable_start(mythr);
 			}
 			
 			if (timer_passed(&mythr->tv_poll, &tv_now))
 				api->poll(mythr);
+			
+			if (timer_passed(&mythr->tv_watchdog, &tv_now))
+			{
+				timer_set_delay(&mythr->tv_watchdog, &tv_now, WATCHDOG_INTERVAL * 1000000);
+				bfg_watchdog(proc, &tv_now);
+			}
 			
 			should_be_running = (proc->deven == DEV_ENABLED && !mythr->pause);
 			if (should_be_running && !mythr->queue_full)
 				goto redo;
 			
 			reduce_timeout_to(&tv_timeout, &mythr->tv_poll);
+			reduce_timeout_to(&tv_timeout, &mythr->tv_watchdog);
 		}
 		
 		do_notifier_select(thr, &tv_timeout);
@@ -600,13 +674,13 @@ void *miner_thread(void *userdata)
 		goto out;
 	}
 
-	if (cgpu->deven != DEV_ENABLED)
-		mt_disable_start(mythr);
+	if (drv_ready(cgpu))
+		cgpu_set_defaults(cgpu);
 	
 	thread_reportout(mythr);
 	applog(LOG_DEBUG, "Popping ping in miner thread");
 	notifier_read(mythr->notifier);  // Wait for a notification to start
-
+	
 	cgtime(&cgpu->cgminer_stats.start_tv);
 	if (drv->minerloop)
 		drv->minerloop(mythr);
@@ -624,7 +698,7 @@ out: ;
 	while ( (proc = proc->next_proc) && !proc->threads);
 	mythr->getwork = 0;
 	mythr->has_pth = false;
-	cgsleep_ms(1000);
+	cgsleep_ms(1);
 	
 	if (drv->thread_shutdown)
 		drv->thread_shutdown(mythr);
@@ -729,6 +803,18 @@ bool add_cgpu_slave(struct cgpu_info *cgpu, struct cgpu_info *prev_cgpu)
 	return true;
 }
 
+#ifdef HAVE_FPGAUTILS
+bool _serial_detect_all(struct lowlevel_device_info * const info, void * const userp)
+{
+	detectone_func_t detectone = userp;
+	
+	if (serial_claim(info->path, NULL))
+		applogr(false, LOG_DEBUG, "%s is already claimed... skipping probes", info->path);
+	
+	return detectone(info->path);
+}
+#endif
+
 int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_func_t autoscan, int flags)
 {
 	struct string_elist *iter, *tmp;
@@ -737,6 +823,7 @@ int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_
 	char found = 0;
 	bool forceauto = flags & 1;
 	bool hasname;
+	bool doall = false;
 	size_t namel = strlen(api->name);
 	size_t dnamel = strlen(api->dname);
 
@@ -768,6 +855,9 @@ int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_
 		else
 		if (!detectone)
 		{}  // do nothing
+		else
+		if (!strcmp(dev, "all"))
+			doall = true;
 #ifdef HAVE_FPGAUTILS
 		else
 		if (serial_claim(dev, NULL))
@@ -778,12 +868,16 @@ int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_
 #endif
 		else if (detectone(dev)) {
 			string_elist_del(&scan_devices, iter);
-			inhibitauto = true;
 			++found;
 		}
 	}
 
-	if ((forceauto || !inhibitauto) && autoscan)
+#ifdef HAVE_FPGAUTILS
+	if (doall && detectone)
+		found += lowlevel_detect_id(_serial_detect_all, detectone, &lowl_vcom, 0, 0);
+#endif
+	
+	if ((forceauto || !(inhibitauto || found)) && autoscan)
 		found += autoscan();
 
 	return found;

@@ -53,6 +53,9 @@ bfgminer_CPPFLAGS += @JANSSON_CFLAGS@
 bfgminer_CPPFLAGS += $(PTHREAD_FLAGS)
 bfgminer_CPPFLAGS += $(NCURSES_CPPFLAGS)
 
+bfgminer_CPPFLAGS += $(AUTOSCAN_CPPFLAGS)
+bfgminer_LDADD += $(AUTOSCAN_LIBS)
+
 bfgminer_LDADD += $(libblkmaker_LIBS)
 bfgminer_LDFLAGS += $(libblkmaker_LDFLAGS)
 bfgminer_CPPFLAGS += $(libblkmaker_CFLAGS)
@@ -177,6 +180,14 @@ bfgminer_SOURCES += iospeeds.h iospeeds_posix.h
 endif
 endif
 
+if HAVE_LIBUSB
+bfgminer_SOURCES += lowl-usb.c
+endif
+
+if NEED_BFG_LOWLEVEL
+bfgminer_SOURCES += lowlevel.c lowlevel.h
+endif
+
 if NEED_DYNCLOCK
 bfgminer_SOURCES += dynclock.c dynclock.h
 endif
@@ -213,6 +224,10 @@ if HAS_AVALON
 bfgminer_SOURCES += driver-avalon.c driver-avalon.h hexdump.c
 endif
 
+if USE_KNC
+bfgminer_SOURCES += driver-knc.c
+endif
+
 if HAS_MODMINER
 bfgminer_SOURCES += driver-modminer.c
 endif
@@ -239,6 +254,20 @@ endif
 if HAS_LITTLEFURY
 bfgminer_SOURCES += driver-littlefury.c
 endif
+
+if HAS_NANOFURY
+bfgminer_SOURCES += driver-nanofury.c mcp2210.c mcp2210.h
+endif
+
+if USE_HASHBUSTER
+bfgminer_SOURCES += driver-hashbuster.c
+endif
+
+endif
+
+if NEED_BFG_LOWL_HID
+bfgminer_SOURCES += lowl-hid.c lowl-hid.h
+bfgminer_CPPFLAGS += $(hidapi_CFLAGS)
 endif
 
 bin_PROGRAMS += bfgminer-rpc

@@ -283,6 +283,12 @@ struct gpu_adl {
 };
 #endif
 
+enum pow_algorithm {
+	POW_SHA256D = 1,
+	POW_SCRYPT  = 2,
+};
+typedef uint8_t supported_algos_t;
+
 struct api_data;
 struct thr_info;
 struct work;
@@ -290,8 +296,11 @@ struct work;
 struct device_drv {
 	const char *dname;
 	const char *name;
+	int8_t probe_priority;
+	supported_algos_t supported_algos;
 
 	// DRV-global functions
+	void (*drv_init)();
 	void (*drv_detect)();
 
 	// Processor-specific functions
@@ -343,9 +352,10 @@ struct device_drv {
 
 enum dev_enable {
 	DEV_ENABLED,
-	DEV_DISABLED,
-	DEV_RECOVER,
-	DEV_RECOVER_ERR,
+	DEV_DISABLED,     // Disabled by user
+	DEV_RECOVER,      // Disabled by temperature cutoff in watchdog
+	DEV_RECOVER_ERR,  // Disabled by communications error
+	DEV_RECOVER_DRV,  // Disabled by driver
 };
 
 enum cl_kernels {
@@ -485,6 +495,7 @@ struct cgpu_info {
 	pthread_cond_t	device_cond;
 
 	enum dev_enable deven;
+	bool already_set_defaults;
 	int accepted;
 	int rejected;
 	int stale;
@@ -627,6 +638,7 @@ struct thr_info {
 	struct work *work;
 	struct work *next_work;
 	enum thr_busy_state busy_state;
+	bool _mt_disable_called;
 	struct timeval tv_morework;
 	struct work *results_work;
 	bool _job_transition_in_progress;
@@ -643,7 +655,6 @@ struct thr_info {
 	// Used by minerloop_queue
 	struct work *work_list;
 	bool queue_full;
-	bool _last_sbr_state;
 
 	bool	work_restart;
 	notifier_t work_restart_notifier;
@@ -831,7 +842,7 @@ static inline void cglock_init(cglock_t *lock)
 	rwlock_init(&lock->rwlock);
 }
 
-/* Read lock variant of cglock */
+/* Read lock variant of cglock. Cannot be promoted. */
 static inline void cg_rlock(cglock_t *lock)
 {
 	mutex_lock(&lock->mutex);
@@ -839,7 +850,8 @@ static inline void cg_rlock(cglock_t *lock)
 	mutex_unlock_noyield(&lock->mutex);
 }
 
-/* Intermediate variant of cglock */
+/* Intermediate variant of cglock - behaves as a read lock but can be promoted
+ * to a write lock or demoted to read lock. */
 static inline void cg_ilock(cglock_t *lock)
 {
 	mutex_lock(&lock->mutex);
@@ -866,6 +878,12 @@ static inline void cg_dwlock(cglock_t *lock)
 	mutex_unlock_noyield(&lock->mutex);
 }
 
+/* Demote a write variant to an intermediate variant */
+static inline void cg_dwilock(cglock_t *lock)
+{
+	wr_unlock(&lock->rwlock);
+}
+
 /* Downgrade intermediate variant to a read lock */
 static inline void cg_dlock(cglock_t *lock)
 {
@@ -880,7 +898,7 @@ static inline void cg_runlock(cglock_t *lock)
 
 static inline void cg_wunlock(cglock_t *lock)
 {
-	wr_unlock(&lock->rwlock);
+	wr_unlock_noyield(&lock->rwlock);
 	mutex_unlock(&lock->mutex);
 }
 
@@ -903,12 +921,16 @@ extern bool opt_fail_only;
 extern bool opt_autofan;
 extern bool opt_autoengine;
 extern bool use_curses;
+#ifdef HAVE_LIBUSB
+extern bool have_libusb;
+#endif
 extern int httpsrv_port;
 extern int stratumsrv_port;
 extern char *opt_api_allow;
 extern bool opt_api_mcast;
 extern char *opt_api_mcast_addr;
 extern char *opt_api_mcast_code;
+extern char *opt_api_mcast_des;
 extern int opt_api_mcast_port;
 extern char *opt_api_groups;
 extern char *opt_api_description;
@@ -996,6 +1018,8 @@ extern void mt_enable(struct thr_info *thr);
 extern void proc_enable(struct cgpu_info *);
 extern void reinit_device(struct cgpu_info *cgpu);
 
+extern void cgpu_set_defaults(struct cgpu_info *);
+
 #ifdef HAVE_ADL
 extern bool gpu_stats(int gpu, float *temp, int *engineclock, int *memclock, float *vddc, int *activity, int *fanspeed, int *fanpercent, int *powertune);
 extern int set_fanspeed(int gpu, int iFanSpeed);
@@ -1011,6 +1035,7 @@ extern int enabled_pools;
 extern bool get_intrange(const char *arg, int *val1, int *val2);
 extern bool detect_stratum(struct pool *pool, char *url);
 extern void print_summary(void);
+extern void adjust_quota_gcd(void);
 extern struct pool *add_pool(void);
 extern bool add_pool_details(struct pool *pool, bool live, char *url, char *user, char *pass);
 
@@ -1050,7 +1075,6 @@ extern bool opt_quiet;
 extern struct thr_info *control_thr;
 extern struct thr_info **mining_thr;
 extern struct cgpu_info gpus[MAX_GPUDEVICES];
-extern int gpu_threads;
 #ifdef USE_SCRYPT
 extern bool opt_scrypt;
 #else
@@ -1070,6 +1094,7 @@ extern enum sha256_algos opt_algo;
 extern struct strategies strategies[];
 extern enum pool_strategy pool_strategy;
 extern int opt_rotate_period;
+extern double total_rolling;
 extern double total_mhashes_done;
 extern unsigned int new_blocks;
 extern unsigned int found_blocks;
@@ -1181,6 +1206,9 @@ struct pool {
 	int solved;
 	int diff1;
 	char diff[8];
+	int quota;
+	int quota_gcd;
+	int quota_used;
 
 	double diff_accepted;
 	double diff_rejected;
@@ -1317,6 +1345,7 @@ struct work {
 
 	unsigned char	work_restart_id;
 	int		id;
+	int		device_id;
 	UT_hash_handle hh;
 	
 	double		work_difficulty;
@@ -1365,6 +1394,7 @@ extern struct work *__find_work_bymidstate(struct work *que, char *midstate, siz
 extern struct work *find_queued_work_bymidstate(struct cgpu_info *cgpu, char *midstate, size_t midstatelen, char *data, int offset, size_t datalen);
 extern struct work *clone_queued_work_bymidstate(struct cgpu_info *cgpu, char *midstate, size_t midstatelen, char *data, int offset, size_t datalen);
 extern void work_completed(struct cgpu_info *cgpu, struct work *work);
+extern struct work *take_queued_work_bymidstate(struct cgpu_info *cgpu, char *midstate, size_t midstatelen, char *data, int offset, size_t datalen);
 extern bool abandon_work(struct work *, struct timeval *work_runtime, uint64_t hashes);
 extern void hash_queued_work(struct thr_info *mythr);
 extern void get_statline3(char *buf, size_t bufsz, struct cgpu_info *, bool for_curses, bool opt_show_procs);
@@ -1373,6 +1403,7 @@ extern void _wlog(const char *str);
 extern void _wlogprint(const char *str);
 extern int curses_int(const char *query);
 extern char *curses_input(const char *query);
+extern bool drv_ready(struct cgpu_info *);
 extern double stats_elapsed(struct cgminer_stats *);
 #define cgpu_runtime(cgpu)  stats_elapsed(&((cgpu)->cgminer_stats))
 extern double cgpu_utility(struct cgpu_info *);

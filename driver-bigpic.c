@@ -13,6 +13,10 @@
  */
 
 #include "config.h"
+
+#include <stdbool.h>
+#include <stdint.h>
+
 #include "miner.h"
 #include "fpgautils.h"
 #include "logging.h"
@@ -25,7 +29,7 @@
 
 #include <stdio.h>
 
-struct device_drv bigpic_drv;
+BFG_REGISTER_DRIVER(bigpic_drv)
 
 //------------------------------------------------------------------------------
 static bool bigpic_detect_custom(const char *devpath, struct device_drv *api, struct bigpic_info *info)
@@ -155,10 +159,6 @@ static bool bigpic_init(struct thr_info *thr)
 	bigpic->device_fd = fd;
 
 	applog(LOG_INFO, "%"PRIpreprv": Opened %s", bigpic->proc_repr, bigpic->device_path);
-
-	struct timeval tv_now;
-	gettimeofday(&tv_now, NULL);
-	timer_set_delay(&thr->tv_poll, &tv_now, 1000000);
 
 	info->tx_buffer[0] = 'W';
 
@@ -310,6 +310,7 @@ static bool bigpic_identify(struct cgpu_info *cgpu)
 struct device_drv bigpic_drv = {
 	.dname = "bigpic",
 	.name = "BPM",
+	.probe_priority = -110,
 
 	.drv_detect = bigpic_detect,
 

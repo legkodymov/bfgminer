@@ -35,7 +35,7 @@ enum littlefury_opcode {
 	LFOP_ADC     = 7,
 };
 
-struct device_drv littlefury_drv;
+BFG_REGISTER_DRIVER(littlefury_drv)
 
 static uint16_t crc16tab[] = {
 	0x0000,0x1021,0x2042,0x3063,0x4084,0x50a5,0x60c6,0x70e7,
@@ -326,9 +326,6 @@ bool littlefury_thread_init(struct thr_info *thr)
 	struct cgpu_info *proc;
 	struct spi_port *spi;
 	struct bitfury_device *bitfury;
-	uint8_t buf[1];
-	uint16_t bufsz = 1;
-	int fd;
 	int i = 0;
 	
 	for (proc = cgpu; proc; proc = proc->next_proc)
@@ -348,70 +345,52 @@ bool littlefury_thread_init(struct thr_info *thr)
 		};
 		
 		proc->device_data = bitfury;
+		
+		bitfury->osc6_bits = 50;
 	}
 	
-	fd = cgpu->device_fd = serial_open(cgpu->device_path, 0, 10, true);
-	if (unlikely(fd == -1))
+	timer_set_now(&thr->tv_poll);
+	cgpu->status = LIFE_INIT2;
+	return true;
+}
+
+static
+void littlefury_disable(struct thr_info * const thr)
+{
+	struct cgpu_info *proc = thr->cgpu;
+	struct cgpu_info * const dev = proc->device;
+	
+	bitfury_disable(thr);
+	
+	// If all chips disabled, kill power and close device
+	bool any_running = false;
+	for (proc = dev; proc; proc = proc->next_proc)
+		if (proc->deven == DEV_ENABLED && !proc->thr[0]->pause)
+		{
+			any_running = true;
+			break;
+		}
+	if (!any_running)
 	{
-		applog(LOG_DEBUG, "%s: %s %s",
-		       cgpu->dev_repr, "Failed to open", cgpu->device_path);
-		return true;
+		uint8_t buf[1];
+		uint16_t bufsz = 1;
+		if (!(bitfury_do_packet(LOG_ERR, dev->dev_repr, dev->device_fd, buf, &bufsz, LFOP_REGPWR, "\0", 1) && bufsz && !buf[0]))
+			applog(LOG_WARNING, "%s: Unable to power off chip(s)", dev->dev_repr);
+		serial_close(dev->device_fd);
+		dev->device_fd = -1;
+		timer_unset(&dev->thr[0]->tv_poll);
 	}
+}
+
+static
+void littlefury_enable(struct thr_info * const thr)
+{
+	struct cgpu_info *proc = thr->cgpu;
+	struct cgpu_info * const dev = proc->device;
+	struct thr_info * const master_thr = dev->thr[0];
 	
-	if (!(bitfury_do_packet(LOG_DEBUG, littlefury_drv.dname, fd, buf, &bufsz, LFOP_REGPWR, "\1", 1) && bufsz && buf[0]))
-		applog(LOG_WARNING, "%s: Unable to power on chip(s)", cgpu->dev_repr);
-	
-	return true;
-}
-
-static
-bool littlefury_do_io(struct thr_info *thr)
-{
-	struct cgpu_info * const proc = thr->cgpu;
-	struct bitfury_device * const bitfury = proc->device_data;
-	bitfury->results_n = 0;
-	libbitfury_sendHashData1(proc->proc_id, bitfury, thr);
-	if (bitfury->job_switched && thr->next_work)
-	{
-		mt_job_transition(thr);
-		// TODO: Delay morework until right before it's needed
-		timer_set_now(&thr->tv_morework);
-		job_start_complete(thr);
-	}
-	if (thr->work && bitfury->results_n)
-		for (int i = bitfury->results_n; i--; )
-			submit_nonce(thr, thr->work, be32toh(bitfury->results[i]));
-	timer_set_delay_from_now(&thr->tv_poll, 10000);
-	return true;
-}
-
-static
-void littlefury_poll(struct thr_info *thr)
-{
-	littlefury_do_io(thr);
-}
-
-static
-bool littlefury_job_prepare(struct thr_info *thr, struct work *work, __maybe_unused uint64_t max_nonce)
-{
-	struct bitfury_device * const bitfury = thr->cgpu->device_data;
-	work_to_payload(&bitfury->payload, thr->next_work);
-	payload_to_atrvec(bitfury->atrvec, &bitfury->payload);
-	return true;
-}
-
-static
-void littlefury_job_start(struct thr_info *thr)
-{
-	littlefury_do_io(thr);
-}
-
-static
-int64_t littlefury_job_process_results(struct thr_info *thr, struct work *work, bool stopping)
-{
-	if (unlikely(stopping))
-		timer_unset(&thr->tv_poll);
-	return 0x100000000;
+	if (!timer_isset(&master_thr->tv_poll))
+		timer_set_now(&master_thr->tv_poll);
 }
 
 static void littlefury_shutdown(struct thr_info *thr)
@@ -422,8 +401,68 @@ static void littlefury_shutdown(struct thr_info *thr)
 	uint16_t bufsz = 1;
 	
 	bitfury_shutdown(thr);
-	if (!(bitfury_do_packet(LOG_DEBUG, cgpu->dev_repr, fd, buf, &bufsz, LFOP_REGPWR, "\0", 1) && bufsz && !buf[0]))
+	if (!(bitfury_do_packet(LOG_ERR, cgpu->dev_repr, fd, buf, &bufsz, LFOP_REGPWR, "\0", 1) && bufsz && !buf[0]))
 		applog(LOG_WARNING, "%s: Unable to power off chip(s)", cgpu->dev_repr);
+}
+
+static
+void littlefury_common_error(struct cgpu_info * const dev, const enum dev_reason reason)
+{
+	for (struct cgpu_info *proc = dev; proc; proc = proc->next_proc)
+	{
+		struct thr_info * const thr = proc->thr[0];
+		dev_error(proc, reason);
+		inc_hw_errors_only(thr);
+	}
+}
+
+static
+void littlefury_poll(struct thr_info * const master_thr)
+{
+	struct cgpu_info * const dev = master_thr->cgpu, *proc;
+	int fd = dev->device_fd;
+	
+	if (unlikely(fd == -1))
+	{
+		uint8_t buf[1];
+		uint16_t bufsz = 1;
+		
+		fd = serial_open(dev->device_path, 0, 10, true);
+		if (unlikely(fd == -1))
+		{
+			applog(LOG_ERR, "%s: Failed to open %s",
+			       dev->dev_repr, dev->device_path);
+			littlefury_common_error(dev, REASON_THREAD_FAIL_INIT);
+			return;
+		}
+		
+		if (!(bitfury_do_packet(LOG_DEBUG, littlefury_drv.dname, fd, buf, &bufsz, LFOP_REGPWR, "\1", 1) && bufsz && buf[0]))
+		{
+			applog(LOG_ERR, "%s: Unable to power on chip(s)", dev->dev_repr);
+			serial_close(fd);
+			littlefury_common_error(dev, REASON_THREAD_FAIL_INIT);
+			return;
+		}
+		
+		dev->device_fd = fd;
+		
+		for (proc = dev; proc; proc = proc->next_proc)
+		{
+			if (proc->deven != DEV_ENABLED || proc->thr[0]->pause)
+				continue;
+			struct bitfury_device * const bitfury = proc->device_data;
+			bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+			bitfury_init_chip(proc);
+		}
+	}
+	
+	return bitfury_do_io(master_thr);
+}
+
+static
+void littlefury_reinit(struct cgpu_info * const proc)
+{
+	timer_set_now(&proc->thr[0]->tv_poll);
 }
 
 struct device_drv littlefury_drv = {
@@ -431,15 +470,25 @@ struct device_drv littlefury_drv = {
 	.name = "LFY",
 	.drv_detect = littlefury_detect,
 	
-	.minerloop = minerloop_async,
 	.thread_init = littlefury_thread_init,
-	.job_prepare = littlefury_job_prepare,
-	.job_start = littlefury_job_start,
-	.poll = littlefury_poll,
-	.job_process_results = littlefury_job_process_results,
-	
-	.minerloop = hash_queued_work,
-	.thread_init = littlefury_thread_init,
-	.scanwork = bitfury_scanHash,
+	.thread_disable = littlefury_disable,
+	.thread_enable = littlefury_enable,
+	.reinit_device = littlefury_reinit,
 	.thread_shutdown = littlefury_shutdown,
+	
+	.minerloop = minerloop_async,
+	.job_prepare = bitfury_job_prepare,
+	.job_start = bitfury_noop_job_start,
+	.poll = littlefury_poll,
+	.job_process_results = bitfury_job_process_results,
+	
+	.get_api_extra_device_detail = bitfury_api_device_detail,
+	.get_api_extra_device_status = bitfury_api_device_status,
+	.set_device = bitfury_set_device,
+	
+#ifdef HAVE_CURSES
+	.proc_wlogprint_status = bitfury_wlogprint_status,
+	.proc_tui_wlogprint_choices = bitfury_tui_wlogprint_choices,
+	.proc_tui_handle_choice = bitfury_tui_handle_choice,
+#endif
 };

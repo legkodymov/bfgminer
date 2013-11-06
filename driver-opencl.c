@@ -16,6 +16,7 @@
 #endif
 
 #ifdef HAVE_CURSES
+// Must be before stdbool, since pdcurses typedefs bool :/
 #include <curses.h>
 #endif
 
@@ -786,7 +787,7 @@ char *set_intensity(char *arg)
 
 
 #ifdef HAVE_OPENCL
-struct device_drv opencl_api;
+BFG_REGISTER_DRIVER(opencl_api)
 
 char *print_ndevs_and_exit(int *ndevs)
 {
@@ -1768,6 +1769,8 @@ static void opencl_thread_shutdown(struct thr_info *thr)
 struct device_drv opencl_api = {
 	.dname = "opencl",
 	.name = "OCL",
+	.probe_priority = 110,
+	.supported_algos = POW_SHA256D | POW_SCRYPT,
 	.drv_detect = opencl_detect,
 	.reinit_device = reinit_opencl_device,
 	.override_statline_temp2 = override_opencl_statline_temp,
