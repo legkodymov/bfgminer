@@ -17,11 +17,13 @@
 #include <stdio.h>
 #include <unistd.h>
 
+#include "binloader.h"
 #include "compat.h"
 #include "dynclock.h"
 #include "logging.h"
 #include "miner.h"
-#include "fpgautils.h"
+#include "lowlevel.h"
+#include "lowl-vcom.h"
 #include "util.h"
 
 #define BITSTREAM_FILENAME "fpgaminer_x6500-overclocker-0402.bit"
@@ -100,6 +102,12 @@ _bailout(int fd, struct cgpu_info*modminer, int prio, const char *fmt, ...)
 // 45 noops sent when detecting, in case the device was left in "start job" reading
 static const char NOOP[] = MODMINER_PING "\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff\xff";
 
+static
+bool modminer_lowl_match(const struct lowlevel_device_info * const info)
+{
+	return lowlevel_match_product(info, "ModMiner");
+}
+
 static bool
 modminer_detect_one(const char *devpath)
 {
@@ -126,7 +134,10 @@ modminer_detect_one(const char *devpath)
 	applog(LOG_DEBUG, "ModMiner identified as: %s", devname);
 
 	if (serial_claim_v(devpath, &modminer_drv))
+	{
+		serial_close(fd);
 		return false;
+	}
 	
 	if (1 != write(fd, MODMINER_FPGA_COUNT, 1))
 		bailout(LOG_DEBUG, "ModMiner detect: write failed on %s (get FPGA count)", devpath);
@@ -156,16 +167,10 @@ modminer_detect_one(const char *devpath)
 
 #undef bailout
 
-static int
-modminer_detect_auto()
+static
+bool modminer_lowl_probe(const struct lowlevel_device_info * const info)
 {
-	return serial_autodetect(modminer_detect_one, "ModMiner");
-}
-
-static void
-modminer_detect()
-{
-	serial_detect_auto(&modminer_drv, modminer_detect_one, modminer_detect_auto);
+	return vcom_lowl_probe_wrapper(info, modminer_detect_one);
 }
 
 #define bailout(...)  return _bailout(-1, modminer, __VA_ARGS__);
@@ -843,7 +848,8 @@ void modminer_wlogprint_status(struct cgpu_info *cgpu)
 struct device_drv modminer_drv = {
 	.dname = "modminer",
 	.name = "MMQ",
-	.drv_detect = modminer_detect,
+	.lowl_match = modminer_lowl_match,
+	.lowl_probe = modminer_lowl_probe,
 	.override_statline_temp2 = get_modminer_upload_percent,
 	.get_stats = modminer_get_stats,
 	.get_api_extra_device_status = get_modminer_drv_extra_device_status,

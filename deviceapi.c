@@ -26,9 +26,11 @@
 
 #include "compat.h"
 #include "deviceapi.h"
-#include "fpgautils.h"
 #include "logging.h"
 #include "lowlevel.h"
+#ifdef NEED_BFG_LOWL_VCOM
+#include "lowl-vcom.h"
+#endif
 #include "miner.h"
 #include "util.h"
 
@@ -517,7 +519,7 @@ void minerloop_async(struct thr_info *mythr)
 			}
 			else  // ! should_be_running
 			{
-				if (unlikely((is_running || !thr->_mt_disable_called) && !mythr->_job_transition_in_progress))
+				if (unlikely((is_running || !mythr->_mt_disable_called) && !mythr->_job_transition_in_progress))
 				{
 disabled: ;
 					timer_unset(&mythr->tv_morework);
@@ -529,7 +531,7 @@ disabled: ;
 							// Avoid starting job when pending result fetch completes
 							mythr->_proceed_with_new_job = false;
 					}
-					else  // !thr->_mt_disable_called
+					else  // !mythr->_mt_disable_called
 						mt_disable_start(mythr);
 				}
 			}
@@ -708,7 +710,10 @@ out: ;
 	return NULL;
 }
 
-bool add_cgpu(struct cgpu_info *cgpu)
+static pthread_mutex_t _add_cgpu_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static
+bool _add_cgpu(struct cgpu_info *cgpu)
 {
 	int lpcount;
 	
@@ -725,7 +730,7 @@ bool add_cgpu(struct cgpu_info *cgpu)
 	strcpy(cgpu->proc_repr, cgpu->dev_repr);
 	sprintf(cgpu->proc_repr_ns, "%s%u", cgpu->drv->name, cgpu->device_id);
 	
-#ifdef HAVE_FPGAUTILS
+#ifdef NEED_BFG_LOWL_VCOM
 	maybe_strdup_if_null(&cgpu->dev_manufacturer, detectone_meta_info.manufacturer);
 	maybe_strdup_if_null(&cgpu->dev_product,      detectone_meta_info.product);
 	maybe_strdup_if_null(&cgpu->dev_serial,       detectone_meta_info.serial);
@@ -780,6 +785,14 @@ bool add_cgpu(struct cgpu_info *cgpu)
 	return true;
 }
 
+bool add_cgpu(struct cgpu_info *cgpu)
+{
+	mutex_lock(&_add_cgpu_mutex);
+	const bool rv = _add_cgpu(cgpu);
+	mutex_unlock(&_add_cgpu_mutex);
+	return rv;
+}
+
 void add_cgpu_live(void *p)
 {
 	add_cgpu(p);
@@ -787,23 +800,28 @@ void add_cgpu_live(void *p)
 
 bool add_cgpu_slave(struct cgpu_info *cgpu, struct cgpu_info *prev_cgpu)
 {
-	int old_total_devices = total_devices_new;
-	
 	if (!prev_cgpu)
 		return add_cgpu(cgpu);
 	
 	while (prev_cgpu->next_proc)
 		prev_cgpu = prev_cgpu->next_proc;
 	
-	if (!add_cgpu(cgpu))
-		return false;
+	mutex_lock(&_add_cgpu_mutex);
 	
+	int old_total_devices = total_devices_new;
+	if (!_add_cgpu(cgpu))
+	{
+		mutex_unlock(&_add_cgpu_mutex);
+		return false;
+	}
 	prev_cgpu->next_proc = devices_new[old_total_devices];
+	
+	mutex_unlock(&_add_cgpu_mutex);
 	
 	return true;
 }
 
-#ifdef HAVE_FPGAUTILS
+#ifdef NEED_BFG_LOWL_VCOM
 bool _serial_detect_all(struct lowlevel_device_info * const info, void * const userp)
 {
 	detectone_func_t detectone = userp;
@@ -827,7 +845,7 @@ int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_
 	size_t namel = strlen(api->name);
 	size_t dnamel = strlen(api->dname);
 
-#ifdef HAVE_FPGAUTILS
+#ifdef NEED_BFG_LOWL_VCOM
 	clear_detectone_meta_info();
 #endif
 	DL_FOREACH_SAFE(scan_devices, iter, tmp) {
@@ -858,7 +876,7 @@ int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_
 		else
 		if (!strcmp(dev, "all"))
 			doall = true;
-#ifdef HAVE_FPGAUTILS
+#ifdef NEED_BFG_LOWL_VCOM
 		else
 		if (serial_claim(dev, NULL))
 		{
@@ -872,7 +890,7 @@ int _serial_detect(struct device_drv *api, detectone_func_t detectone, autoscan_
 		}
 	}
 
-#ifdef HAVE_FPGAUTILS
+#ifdef NEED_BFG_LOWL_VCOM
 	if (doall && detectone)
 		found += lowlevel_detect_id(_serial_detect_all, detectone, &lowl_vcom, 0, 0);
 #endif

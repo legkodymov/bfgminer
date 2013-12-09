@@ -23,7 +23,8 @@
 #include "compat.h"
 #include "deviceapi.h"
 #include "miner.h"
-#include "fpgautils.h"
+#include "lowlevel.h"
+#include "lowl-vcom.h"
 #include "util.h"
 
 #define BITFORCE_SLEEP_MS 500
@@ -165,6 +166,12 @@ int bitforce_chips_to_plan_for(int parallel, int chipcount) {
 	                    return  1;
 }
 
+static
+bool bitforce_lowl_match(const struct lowlevel_device_info * const info)
+{
+	return lowlevel_match_product(info, "BitFORCE", "SHA256");
+}
+
 static bool bitforce_detect_one(const char *devpath)
 {
 	int fdDev = serial_open(devpath, 0, 10, true);
@@ -175,6 +182,7 @@ static bool bitforce_detect_one(const char *devpath)
 	int procs = 1, parallel = -1;
 	long maxchipno = 0;
 	struct bitforce_init_data *initdata;
+	char *manuf = NULL;
 
 	applog(LOG_DEBUG, "BFL: Attempting to open %s", devpath);
 
@@ -197,7 +205,10 @@ static bool bitforce_detect_one(const char *devpath)
 	}
 
 	if (serial_claim_v(devpath, &bitforce_drv))
+	{
+		BFclose(fdDev);
 		return false;
+	}
 	
 	applog(LOG_DEBUG, "Found BitForce device on %s", devpath);
 	initdata = malloc(sizeof(*initdata));
@@ -232,6 +243,17 @@ static bool bitforce_detect_one(const char *devpath)
 		else
 		if (!strncasecmp(pdevbuf, "CHIP PARALLELIZATION: YES @", 27))
 			parallel = atoi(&pdevbuf[27]);
+		else
+		if (!strncasecmp(pdevbuf, "MANUFACTURER:", 13))
+		{
+			manuf = &pdevbuf[13];
+			while (manuf[0] && isspace(manuf[0]))
+				++manuf;
+			if (manuf[0])
+				manuf = strdup(manuf);
+			else
+				manuf = NULL;
+		}
 	}
 	parallel = bitforce_chips_to_plan_for(parallel, maxchipno);
 	initdata->parallels = malloc(sizeof(initdata->parallels[0]) * procs);
@@ -280,6 +302,8 @@ static bool bitforce_detect_one(const char *devpath)
 	if (initdata->sc)
 		bitforce->drv = &bitforce_queue_api;
 	bitforce->device_path = strdup(devpath);
+	if (manuf)
+		bitforce->dev_manufacturer = manuf;
 	bitforce->deven = DEV_ENABLED;
 	bitforce->procs = parallel;
 	bitforce->threads = 1;
@@ -297,14 +321,10 @@ static bool bitforce_detect_one(const char *devpath)
 	return add_cgpu(bitforce);
 }
 
-static int bitforce_detect_auto(void)
+static
+bool bitforce_lowl_probe(const struct lowlevel_device_info * const info)
 {
-	return serial_autodetect(bitforce_detect_one, "BitFORCE", "SHA256");
-}
-
-static void bitforce_detect(void)
-{
-	serial_detect_auto(&bitforce_drv, bitforce_detect_one, bitforce_detect_auto);
+	return vcom_lowl_probe_wrapper(info, bitforce_detect_one);
 }
 
 struct bitforce_data {
@@ -1572,7 +1592,8 @@ char *bitforce_set_device(struct cgpu_info *proc, char *option, char *setting, c
 struct device_drv bitforce_drv = {
 	.dname = "bitforce",
 	.name = "BFL",
-	.drv_detect = bitforce_detect,
+	.lowl_match = bitforce_lowl_match,
+	.lowl_probe = bitforce_lowl_probe,
 #ifdef HAVE_CURSES
 	.proc_wlogprint_status = bitforce_wlogprint_status,
 	.proc_tui_wlogprint_choices = bitforce_tui_wlogprint_choices,
@@ -2085,6 +2106,9 @@ static void bitforce_queue_thread_enable(struct thr_info *thr)
 struct device_drv bitforce_queue_api = {
 	.dname = "bitforce_queue",
 	.name = "BFL",
+	.lowl_probe_by_name_only = true,
+	.lowl_match = bitforce_lowl_match,
+	.lowl_probe = bitforce_lowl_probe,
 	.minerloop = minerloop_queue,
 	.reinit_device = bitforce_reinit,
 #ifdef HAVE_CURSES

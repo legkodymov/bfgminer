@@ -13,8 +13,8 @@ dnl * any later version.  See COPYING for more details.
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_maj], [3])
-m4_define([v_min], [5])
-m4_define([v_mic], [0])
+m4_define([v_min], [8])
+m4_define([v_mic], [1])
 ##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##--##
 m4_define([v_ver], [v_maj.v_min.v_mic])
 m4_define([lt_rev], m4_eval(v_maj + v_min))
@@ -30,6 +30,12 @@ AC_CANONICAL_SYSTEM
 AC_CONFIG_MACRO_DIR([m4])
 AC_CONFIG_SRCDIR([miner.c])
 AC_CONFIG_HEADERS([config.h])
+
+AH_BOTTOM([
+#ifdef WIN32
+#include <winsock2.h>
+#endif
+])
 
 AM_INIT_AUTOMAKE([foreign subdir-objects])
 m4_ifdef([AM_SILENT_RULES], [AM_SILENT_RULES([yes])])
@@ -103,16 +109,22 @@ AC_CHECK_HEADERS([pwd.h])
 # Check for chroot support
 AC_CHECK_FUNCS([chroot])
 
+AC_CHECK_FUNCS([sleep])
+
 AC_FUNC_ALLOCA
 
 driverlist=
 algolist=SHA256d
 optlist=
 
+has_fpga=no
+has_asic=no
+need_binloader=no
 need_dynclock=no
-need_fpgautils=no
+need_lowl_vcom=no
 need_lowlevel=no
 need_lowl_hid=no
+need_lowl_usb=no
 have_cygwin=false
 have_win32=false
 have_macho=false
@@ -186,15 +198,15 @@ m4_define([BFG_PREPROC_IFELSE],
 
 
 AC_CHECK_DECL([HASH_ITER],[
-	AC_CHECK_DECL([DL_FOREACH_SAFE],[
+	AC_CHECK_DECL([DL_CONCAT],[
 		true
 	],[
-		AC_MSG_ERROR([Could not find DL_FOREACH_SAFE - install uthash-dev 1.9.2+])
+		AC_MSG_ERROR([Could not find DL_FOREACH_SAFE - install uthash-dev 1.9.4+])
 	],[
 		#include <utlist.h>
 	])
 ],[
-	AC_MSG_ERROR([Could not find HASH_ITER - please install uthash-dev 1.9.2+])
+	AC_MSG_ERROR([Could not find HASH_ITER - please install uthash-dev 1.9.4+])
 ],[
 	#include <uthash.h>
 ])
@@ -215,16 +227,14 @@ fi
 AM_CONDITIONAL([HAS_CPUMINE], [test x$cpumining = xyes])
 
 driverlist="$driverlist opencl"
-opencl="yes"
+opencl="no"
 
 AC_ARG_ENABLE([opencl],
-	[AC_HELP_STRING([--disable-opencl],[Build without support for OpenCL (default enabled)])],
+	[AC_HELP_STRING([--enable-opencl],[Compile support for OpenCL (default disabled)])],
 	[opencl=$enableval]
 	)
 if test "x$opencl" = xyes; then
 	AC_DEFINE([HAVE_OPENCL], [1], [Defined to 1 if OpenCL support is wanted])
-else
-	DLOPEN_FLAGS=""
 fi
 AM_CONDITIONAL([HAVE_OPENCL], [test x$opencl = xyes])
 
@@ -355,7 +365,9 @@ AC_ARG_ENABLE([bitforce],
 	)
 if test "x$bitforce" = xyes; then
 	AC_DEFINE([USE_BITFORCE], [1], [Defined to 1 if BitForce support is wanted])
-	need_fpgautils=yes
+	need_lowl_vcom=yes
+	has_fpga=yes
+	has_asic=yes
 fi
 AM_CONDITIONAL([HAS_BITFORCE], [test x$bitforce = xyes])
 
@@ -368,7 +380,9 @@ AC_ARG_ENABLE([icarus],
 if test "x$icarus" = xyes; then
 	AC_DEFINE([USE_ICARUS], [1], [Defined to 1 if Icarus support is wanted])
 	need_dynclock=yes
-	need_fpgautils=yes
+	need_lowl_vcom=yes
+	has_fpga=yes
+	has_asic=yes
 fi
 AM_CONDITIONAL([HAS_ICARUS], [test x$icarus = xyes])
 
@@ -382,9 +396,11 @@ AC_ARG_ENABLE([avalon],
 	)
 if test "x$avalon" = xyes; then
 	AC_DEFINE([USE_AVALON], [1], [Defined to 1 if Avalon support is wanted])
-	need_fpgautils=yes
+	need_lowl_vcom=yes
+	has_asic=yes
 fi
 AM_CONDITIONAL([HAS_AVALON], [test x$avalon = xyes])
+
 
 driverlist="$driverlist knc"
 AC_ARG_ENABLE([knc],
@@ -477,14 +493,23 @@ AC_ARG_ENABLE([modminer],
 if test "x$modminer" = xyes; then
 	AC_DEFINE([USE_MODMINER], [1], [Defined to 1 if ModMiner support is wanted])
 	need_dynclock=yes
-	need_fpgautils=yes
+	need_lowl_vcom=yes
+	need_binloader=yes
+	has_fpga=yes
 fi
 AM_CONDITIONAL([HAS_MODMINER], [test x$modminer = xyes])
 
 PKG_PROG_PKG_CONFIG()
 
+optlist="$optlist libusb"
 libusb=no
 libusb_include_path=""
+AC_ARG_WITH([libusb],
+	[AC_HELP_STRING([--without-libusb],[Compile using libusb (default enabled)])],
+	[want_libusb=$withval],
+	[want_libusb=yes]
+	)
+if test "x$want_libusb" = "xyes"; then
 PKG_CHECK_MODULES([LIBUSB], [libusb-1.0],[
 	libusb=yes
 ],[
@@ -496,10 +521,10 @@ PKG_CHECK_MODULES([LIBUSB], [libusb-1.0],[
 	done
 	if test "x$libusb" = xyes; then
 			AC_CHECK_DECL([libusb_init],[
-				true
+				LIBUSB_LIBS="-l$usb_lib"
 			],[
 				AC_MSG_CHECKING([whether libusb_init is declared in subdirectory])
-				libusb_include_path=`echo '#include <libusb-1.0/libusb.h>' | ${CPP} -M - 2>/dev/null | tr -d '\\n\\r\\\\' | sed -e 's/^.*[[:space:]:]\(\/[^[:space:]]*\)libusb\.h[[:space:]].*$/\1/' -e t -e d`
+				libusb_include_path=`echo '#include <libusb-1.0/libusb.h>' | ${CPP} -M - 2>/dev/null | sed -E -e 's/^[^:]+:[[:space:]]*(([^[:space:]]|\\\\[[:space:]])*)libusb\\.h([[:space:]].*|$)$/\\1/' -e 't my' -e d -e ': my' -e 's/\\\\?([\\\\[:space:]])/\\\\\\1/g'`
 				if test "x$libusb_include_path" != "x"; then
 					LIBUSB_LIBS="-l$usb_lib"
 					LIBUSB_CFLAGS="-I$libusb_include_path"
@@ -511,6 +536,32 @@ PKG_CHECK_MODULES([LIBUSB], [libusb-1.0],[
 			],[#include <libusb.h>])
 	fi
 ])
+fi
+
+driverlist="$driverlist klondike"
+AC_ARG_ENABLE([klondike],
+	[AC_HELP_STRING([--disable-klondike],[Compile support for Klondike (default enabled)])],
+	[klondike=$enableval],
+	[klondike=auto]
+	)
+if test "x$klondike$want_libusb" = xyesno; then
+	AC_MSG_ERROR([You disabled libusb, required for Klondike support])
+elif test "x$klondike$libusb" = xyesno; then
+	AC_MSG_ERROR([Could not find libusb, required for Klondike support])
+elif test "x$klondike" = xauto; then
+	klondike="$libusb"
+	if test "x$libusb" = xno; then
+		AC_MSG_WARN([Could not find libusb, required for Klondike support])
+		klondike_enableaction="install libusb 1.0+"
+	fi
+fi
+if test "x$klondike" = xyes; then
+	AC_DEFINE([USE_KLONDIKE], [1], [Defined to 1 if Klondike support is wanted])
+	need_lowl_usb=yes
+	has_asic=yes
+fi
+AM_CONDITIONAL([HAS_KLONDIKE], [test x$klondike = xyes])
+
 
 driverlist="$driverlist x6500"
 AC_ARG_ENABLE([x6500],
@@ -518,7 +569,9 @@ AC_ARG_ENABLE([x6500],
 	[x6500=$enableval],
 	[x6500=auto]
 	)
-if test "x$x6500$libusb" = xyesno; then
+if test "x$x6500$want_libusb" = xyesno; then
+	AC_MSG_ERROR([You disabled libusb, required for X6500 support])
+elif test "x$x6500$libusb" = xyesno; then
 	AC_MSG_ERROR([Could not find libusb, required for X6500 support])
 elif test "x$x6500" = xauto; then
 	x6500="$libusb"
@@ -530,8 +583,9 @@ fi
 if test "x$x6500" = xyes; then
 	AC_DEFINE([USE_X6500], [1], [Defined to 1 if X6500 support is wanted])
 	need_dynclock=yes
-	need_fpgautils=yes
-	need_lowlevel=yes
+	need_lowl_usb=yes
+	need_binloader=yes
+	has_fpga=yes
 fi
 AM_CONDITIONAL([HAS_X6500], [test x$x6500 = xyes])
 
@@ -541,7 +595,9 @@ AC_ARG_ENABLE([ztex],
 	[ztex=$enableval],
 	[ztex=auto]
 	)
-if test "x$ztex$libusb" = xyesno; then
+if test "x$ztex$want_libusb" = xyesno; then
+	AC_MSG_ERROR([You disabled libusb, required for ZTEX support])
+elif test "x$ztex$libusb" = xyesno; then
 	AC_MSG_ERROR([Could not find libusb, required for ZTEX support])
 elif test "x$ztex" = xauto; then
 	ztex="$libusb"
@@ -553,9 +609,25 @@ fi
 if test "x$ztex" = xyes; then
 	AC_DEFINE([USE_ZTEX], [1], [Defined to 1 if ZTEX support is wanted])
 	need_dynclock=yes
-	need_fpgautils=yes
+	need_lowl_usb=yes
+	need_binloader=yes
+	has_fpga=yes
 fi
 AM_CONDITIONAL([HAS_ZTEX], [test x$ztex = xyes])
+
+
+driverlist="$driverlist bifury"
+AC_ARG_ENABLE([bifury],
+	[AC_HELP_STRING([--disable-bifury],[Compile support for Bi*Fury (default enabled)])],
+	[bifury=$enableval],
+	[bifury=yes]
+	)
+if test "x$bifury" = "xyes"; then
+	AC_DEFINE([USE_BIFURY], [1], [Defined to 1 if Bi*Fury support is wanted])
+	need_lowl_vcom=yes
+	has_asic=yes
+fi
+AM_CONDITIONAL([USE_BIFURY], [test x$bifury = xyes])
 
 
 driverlist="$driverlist bitfury_gpio/bitfury"
@@ -602,10 +674,32 @@ else
 fi
 if test "x$bigpic" = "xyes"; then
 	AC_DEFINE([USE_BIGPIC], [1], [Defined to 1 if Big Picture Mining USB support is wanted])
-	need_fpgautils=yes
+	need_lowl_vcom=yes
+	has_asic=yes
 fi
 AM_CONDITIONAL([HAS_BIGPIC], [test x$bigpic = xyes])
 
+driverlist="$driverlist twinfury"
+twinfury=auto
+AC_ARG_ENABLE([twinfury],
+    [AC_HELP_STRING([--disable-twinfury],[Compile support for Twinfury USB miner (default enabled)])],
+    [twinfury=$enableval]
+    )
+if test "x$twinfury" = "xno"; then
+    true
+elif test "x$bitfury" = "xyes"; then
+    twinfury=yes
+elif test "x$twinfury" = "xyes"; then
+    AC_MSG_ERROR([You explicitly disabled Bitfury and explicitly enabled Twinfury])
+else
+    twinfury=no
+fi
+if test "x$twinfury" = "xyes"; then
+    AC_DEFINE([USE_TWINFURY], [1], [Defined to 1 if Twinfury USB miner support is wanted])
+    need_lowl_vcom=yes
+    has_asic=yes
+fi
+AM_CONDITIONAL([HAS_TWINFURY], [test x$twinfury = xyes])
 
 driverlist="$driverlist littlefury"
 littlefury=auto
@@ -624,7 +718,8 @@ else
 fi
 if test "x$littlefury" = "xyes"; then
 	AC_DEFINE([USE_LITTLEFURY], [1], [Defined to 1 if LittleFury support is wanted])
-	need_fpgautils=yes
+	need_lowl_vcom=yes
+	has_asic=yes
 fi
 AM_CONDITIONAL([HAS_LITTLEFURY], [test x$littlefury = xyes])
 
@@ -666,9 +761,8 @@ else
 fi
 if test "x$nanofury" = "xyes"; then
 	AC_DEFINE([USE_NANOFURY], [1], [Defined to 1 if NanoFury support is wanted])
-	need_fpgautils=yes
-	need_lowlevel=yes
 	need_lowl_hid=yes
+	has_asic=yes
 fi
 AM_CONDITIONAL([HAS_NANOFURY], [test x$nanofury = xyes])
 
@@ -676,7 +770,7 @@ AM_CONDITIONAL([HAS_NANOFURY], [test x$nanofury = xyes])
 driverlist="$driverlist hashbuster"
 hashbuster=auto
 AC_ARG_ENABLE([hashbuster],
-	[AC_HELP_STRING([--disable-hashbuster],[Compile support for HashBuster (default enabled)])],
+	[AC_HELP_STRING([--disable-hashbuster],[Compile support for HashBuster Nano (default enabled)])],
 	[hashbuster=$enableval]
 	)
 if test "x$hashbuster" = "xno"; then
@@ -689,21 +783,45 @@ elif test "x$bitfury" = "xyes"; then
 			hashbuster=no
 			hashbuster_enableaction="install hidapi"
 		else
-			AC_MSG_ERROR([Could not find hidapi, required for HashBuster support])
+			AC_MSG_ERROR([Could not find hidapi, required for HashBuster Nano support])
 		fi
 	fi
 elif test "x$hashbuster" = "xyes"; then
-	AC_MSG_ERROR([You explicitly disabled Bitfury and explicitly enabled HashBuster])
+	AC_MSG_ERROR([You explicitly disabled Bitfury and explicitly enabled HashBuster Nano])
 else
 	hashbuster=no
 fi
 if test "x$hashbuster" = "xyes"; then
-	AC_DEFINE([USE_HASHBUSTER], [1], [Defined to 1 if HashBuster support is wanted])
-	need_fpgautils=yes
-	need_lowlevel=yes
+	AC_DEFINE([USE_HASHBUSTER], [1], [Defined to 1 if HashBuster Nano support is wanted])
 	need_lowl_hid=yes
+	has_asic=yes
 fi
 AM_CONDITIONAL([USE_HASHBUSTER], [test x$hashbuster = xyes])
+
+
+driverlist="$driverlist hashbusterusb"
+AC_ARG_ENABLE([hashbusterusb],
+	[AC_HELP_STRING([--disable-hashbusterusb],[Compile support for HashBuster Micro (default if libusb)])],
+	[hashbusterusb=$enableval],
+	[hashbusterusb=auto]
+	)
+if test "x$hashbusterusb$want_libusb" = xyesno; then
+	AC_MSG_ERROR([You disabled libusb, required for HashBuster Micro support])
+elif test "x$hashbusterusb$libusb" = xyesno; then
+	AC_MSG_ERROR([Could not find libusb, required for HashBuster Micro support])
+elif test "x$hashbusterusb" = xauto; then
+	hashbusterusb="$libusb"
+	if test "x$libusb" = xno; then
+		AC_MSG_WARN([Could not find libusb, required for HashBuster Micro support])
+		hashbusterusb_enableaction="install libusb 1.0+"
+	fi
+fi
+if test "x$hashbusterusb" = xyes; then
+	AC_DEFINE([USE_HASHBUSTERUSB], [1], [Defined to 1 if HashBuster Micro support is wanted])
+	need_lowl_usb=yes
+	has_asic=yes
+fi
+AM_CONDITIONAL([USE_HASHBUSTERUSB], [test x$hashbusterusb = xyes])
 
 
 driverlist="$driverlist metabank"
@@ -721,7 +839,12 @@ fi
 AM_CONDITIONAL([HAS_METABANK], [test x$metabank = xyes])
 
 
-if test "x$x6500$ztex" = "xnono"; then
+if test "x$need_lowl_vcom" != "xno"; then
+	# Lowlevel VCOM doesn't need libusb, but it can take advantage of it to reattach drivers
+	need_lowl_usb=yes
+fi
+
+if test "x$need_lowl_usb" = "xno"; then
 	libusb=no
 	LIBUSB_LIBS=''
 	LIBUSB_CFLAGS=''
@@ -747,8 +870,8 @@ if test "x$scrypt" = xyes; then
 fi
 
 
-if test x$need_fpgautils = xyes; then
-	AC_DEFINE([HAVE_FPGAUTILS], [1], [Defined to 1 if fpgautils is being used])
+if test x$need_lowl_vcom = xyes; then
+	AC_DEFINE([NEED_BFG_LOWL_VCOM], [1], [Defined to 1 if lowlevel VCOM drivers are being used])
 	need_lowlevel=yes
 	
 	if $have_win32; then
@@ -760,7 +883,7 @@ if test x$need_fpgautils = xyes; then
 		],[
 			AC_CHECK_HEADER([ddk/usbiodef.h],[
 				found_ddkusb=true
-				AUTOSCAN_CPPFLAGS="-I"`echo '#include <ddk/usbiodef.h>' | ${CPP} -M - 2>/dev/null | tr -d '\\n\\r\\\\' | sed -e 's/^.*[[:space:]:]\(\/[^[:space:]]*\)usbiodef\.h[[:space:]].*$/\1/' -e t -e d`
+				AUTOSCAN_CPPFLAGS="-I"`echo '#include <ddk/usbiodef.h>' | ${CPP} -M - 2>/dev/null | sed -E -e 's/^[^:]+:[[:space:]]*(([^[:space:]]|\\\\[[:space:]])*)usbiodef\\.h([[:space:]].*|$)$/\\1/' -e 't my' -e d -e ': my' -e 's/\\\\?([\\\\[:space:]])/\\\\\\1/g'`
 			],[
 				true
 			],[
@@ -789,8 +912,20 @@ if test x$need_fpgautils = xyes; then
 	fi
 fi
 
+if test "x$opencl$need_lowl_hid" = xnono; then
+	DLOPEN_FLAGS=""
+fi
+
 if test x$need_lowl_hid = xyes; then
 	AC_DEFINE([NEED_BFG_LOWL_HID], [1], [Defined to 1 if lowlevel hid drivers are being used])
+	need_lowlevel=yes
+fi
+
+if test x$need_lowl_usb = xyes; then
+	need_lowlevel=yes
+fi
+
+if test x$need_lowl_vcom = xyes; then
 	need_lowlevel=yes
 fi
 
@@ -866,7 +1001,7 @@ else
 				AC_MSG_CHECKING([for curses header subdirectory])
 				barelib="${barelib/6/}"
 				barelib="${barelib/5/}"
-				cursesincl=`echo "#include <${barelib}/curses.h>" | ${CPP} -M - 2>/dev/null | tr -d '\\n\\r\\\\' | sed -e 's/^.*[[:space:]:]\(\/[^[:space:]]*\)libusb\.h[[:space:]].*$/\1/' -e t -e d`
+				cursesincl=`echo '#include <'"${barelib}"'/curses.h>' | ${CPP} -M - 2>/dev/null | sed -E -e 's/^[^:]+:[[:space:]]*(([^[:space:]]|\\\\[[:space:]])*)curses\\.h([[:space:]].*|$)$/\\1/' -e 't my' -e d -e ': my' -e 's/\\\\?([\\\\[:space:]])/\\\\\\1/g'`
 				if test "x$cursesincl" != "x"; then
 					NCURSES_CPPFLAGS="-I${cursesincl}"
 					AC_MSG_RESULT([$cursesincl])
@@ -949,8 +1084,9 @@ AC_SUBST(libblkmaker_LIBS)
 
 
 AM_CONDITIONAL([NEED_LIBBLKMAKER], [test x$with_system_libblkmaker != xyes])
+AM_CONDITIONAL([NEED_BFG_BINLOADER], [test x$need_binloader = xyes])
 AM_CONDITIONAL([NEED_DYNCLOCK], [test x$need_dynclock = xyes])
-AM_CONDITIONAL([NEED_FPGAUTILS], [test x$need_fpgautils = xyes])
+AM_CONDITIONAL([NEED_BFG_LOWL_VCOM], [test x$need_lowl_vcom = xyes])
 AM_CONDITIONAL([NEED_BFG_LOWL_HID], [test x$need_lowl_hid = xyes])
 AM_CONDITIONAL([NEED_BFG_LOWLEVEL], [test x$need_lowlevel = xyes])
 AM_CONDITIONAL([HAS_SCRYPT], [test x$scrypt = xyes])
@@ -961,8 +1097,8 @@ AM_CONDITIONAL([HAVE_LIBUSB], [test x$libusb = xyes])
 AM_CONDITIONAL([HAVE_WINDOWS], [test x$have_win32 = xtrue])
 AM_CONDITIONAL([HAVE_x86_64], [test x$have_x86_64 = xtrue])
 AM_CONDITIONAL([HAVE_WIN_DDKUSB], [test x$found_ddkusb = xtrue])
-AM_CONDITIONAL([HAS_FPGA], [test x$bitforce$icarus$modminer$x6500$ztex != xnonononono])
-AM_CONDITIONAL([HAS_ASIC], [test x$avalon$bfsb$bigpic$icarus$httpsrv$metabank != xnononononono])
+AM_CONDITIONAL([HAS_FPGA], [test x$has_fpga != xno])
+AM_CONDITIONAL([HAS_ASIC], [test x$has_asic != xno])
 
 dnl Find YASM
 has_yasm=false
@@ -1058,7 +1194,7 @@ if test "x$cpumining$have_x86_32" = "xyestrue"; then
 fi
 AM_CONDITIONAL([HAVE_SSE2], [test "x$have_sse2" = "xyes"])
 
-if test "x$need_fpgautils" = "xyes"; then
+if test "x$need_lowl_vcom" = "xyes"; then
 	AC_ARG_WITH([libudev], [AC_HELP_STRING([--without-libudev], [Autodetect FPGAs using libudev (default enabled)])],
 		[libudev=$withval],
 		[libudev=auto]
@@ -1127,21 +1263,6 @@ AC_LINK_IFELSE([AC_LANG_SOURCE([int main(void) { return __builtin_types_compatib
 AC_COMPILE_IFELSE([AC_LANG_SOURCE([static int __attribute__((warn_unused_result)) func(int x) { return x; }])],
 			  AC_DEFINE([HAVE_WARN_UNUSED_RESULT], [1],
                                     [Define if __attribute__((warn_unused_result))]))
-
-AC_MSG_CHECKING([for roundl function])
-save_LIBS="${LIBS}"
-LIBS="$LIBS -lm"
-AC_LINK_IFELSE([AC_LANG_PROGRAM([[
-	#include <math.h>
-]], [[
-	return (roundl(*(long double *)0xdeadbeef) == 1.0);
-]])], [
-	AC_MSG_RESULT([yes])
-], [
-	AC_MSG_RESULT([no])
-	AC_DEFINE([NEED_ROUNDL], [1], [Defined to 1 if C99 roundl is missing])
-])
-LIBS="${save_LIBS}"
 
 
 # byteswap functions
@@ -1292,43 +1413,6 @@ AC_DEFINE_UNQUOTED([DIABLO_KERNNAME], ["diablo130302"], [Filename for diablo ker
 AC_DEFINE_UNQUOTED([SCRYPT_KERNNAME], ["scrypt130511"], [Filename for scrypt kernel])
 
 
-AC_SUBST(AUTOSCAN_CPPFLAGS)
-AC_SUBST(AUTOSCAN_LIBS)
-AC_SUBST(PTHREAD_FLAGS)
-AC_SUBST(DLOPEN_FLAGS)
-AC_SUBST(PTHREAD_LIBS)
-AC_SUBST(NCURSES_CPPFLAGS)
-AC_SUBST(NCURSES_LIBS)
-AC_SUBST(PDCURSES_LIBS)
-AC_SUBST(WS2_LIBS)
-AC_SUBST(MM_LIBS)
-AC_SUBST(MATH_LIBS)
-AC_SUBST(RT_LIBS)
-AC_SUBST(UDEV_LIBS)
-AC_SUBST(SSE2_CFLAGS)
-AC_SUBST(YASM_FMT)
-
-AC_CONFIG_FILES([
-	Makefile
-	x86_64/Makefile
-	x86_32/Makefile
-	ccan/Makefile
-	lib/Makefile
-	])
-
-
-echo
-echo
-echo
-echo "------------------------------------------------------------------------"
-echo "$PACKAGE $VERSION"
-echo "------------------------------------------------------------------------"
-echo
-echo
-echo "Configuration Options Summary:"
-echo
-
-
 m4_define([BFG_PRINT_LIST],[
 	eval _mylist="\$$2"
 	_yeslist=
@@ -1353,24 +1437,55 @@ EOF
 	_yeslist=`echo "$_yeslist" | tr ' ' '\n' | sort | tr '\n' ' '`
 	_nolist=`echo "$_nolist" | tr ' ' '\n' | sort | tr '\n' ' '`
 	AC_DEFINE_UNQUOTED(AS_TR_CPP([BFG_$2]),["$_yeslist"],[List of drivers being built])
-	echo "  Enabled..$1..:$_yeslist"
-	echo "  Disabled.$1..:$_nolist"
-	if test -n "$_enableactions"; then
-		echo "${_enableactions:1}" | tr '~' '\n'
-	fi
+	$2_print="  Enabled..$1..:${_yeslist}~  Disabled.$1..:${_nolist}${_enableactions}"
 ])
 BFG_PRINT_LIST([Drivers...],[driverlist])
 BFG_PRINT_LIST([Algorithms],[algolist])
 BFG_PRINT_LIST([Options...],[optlist])
 
 
-echo
-echo "Compilation............: make (or gmake)"
-echo "  CFLAGS...............: $CPPFLAGS $AUTOSCAN_CPPFLAGS $NCURSES_CPPFLAGS $PTHREAD_FLAGS $CFLAGS $LIBUSB_CFLAGS $JANSSON_CFLAGS $PTHREAD_FLAGS $libblkmaker_CFLAGS $hidapi_CFLAGS"
-echo "  LDFLAGS..............: $LDFLAGS $AUTOSCAN_LIBS $PTHREAD_FLAGS $libblkmaker_LDFLAGS $PTHREAD_LIBS $LIBS $DLOPEN_FLAGS $LIBCURL_LIBS $JANSSON_LIBS $NCURSES_LIBS $PDCURSES_LIBS $WS2_LIBS $MATH_LIBS $UDEV_LIBS $LIBUSB_LIBS $RT_LIBS $sensors_LIBS $libblkmaker_LIBS"
-echo
-echo "Installation...........: make install$maybe_ldconfig #(as root if needed, with 'su' or 'sudo')"
-echo "  prefix...............: $prefix"
-echo
+AC_SUBST(AUTOSCAN_CPPFLAGS)
+AC_SUBST(AUTOSCAN_LIBS)
+AC_SUBST(PTHREAD_FLAGS)
+AC_SUBST(DLOPEN_FLAGS)
+AC_SUBST(PTHREAD_LIBS)
+AC_SUBST(NCURSES_CPPFLAGS)
+AC_SUBST(NCURSES_LIBS)
+AC_SUBST(PDCURSES_LIBS)
+AC_SUBST(WS2_LIBS)
+AC_SUBST(MM_LIBS)
+AC_SUBST(MATH_LIBS)
+AC_SUBST(RT_LIBS)
+AC_SUBST(UDEV_LIBS)
+AC_SUBST(SSE2_CFLAGS)
+AC_SUBST(YASM_FMT)
+
+AC_CONFIG_FILES([
+	Makefile
+	x86_64/Makefile
+	x86_32/Makefile
+	ccan/Makefile
+	lib/Makefile
+	])
 
 AC_OUTPUT
+
+
+wordfilter ()
+{
+  echo "$1" | sed 's/ \+/ /g;s/^ *//;s/ *$//'
+}
+
+echo
+echo "------------------------------------------------------------------------"
+echo "$PACKAGE $VERSION configuration options summary"
+echo "------------------------------------------------------------------------"
+echo
+echo "  CFLAGS...............: "`wordfilter "$CPPFLAGS $AUTOSCAN_CPPFLAGS $NCURSES_CPPFLAGS $PTHREAD_FLAGS $CFLAGS $LIBUSB_CFLAGS $JANSSON_CFLAGS $PTHREAD_FLAGS $libblkmaker_CFLAGS $hidapi_CFLAGS"`
+echo "  LDFLAGS..............: "`wordfilter "$LDFLAGS $AUTOSCAN_LIBS $PTHREAD_FLAGS $libblkmaker_LDFLAGS $PTHREAD_LIBS $LIBS $DLOPEN_FLAGS $LIBCURL_LIBS $JANSSON_LIBS $NCURSES_LIBS $PDCURSES_LIBS $WS2_LIBS $MATH_LIBS $UDEV_LIBS $LIBUSB_LIBS $RT_LIBS $sensors_LIBS $libblkmaker_LIBS"`
+echo "  Installation.prefix..: $prefix"
+echo
+echo "${driverlist_print}" | tr '~' '\n'
+echo "${algolist_print}" | tr '~' '\n'
+echo "${optlist_print}" | tr '~' '\n'
+echo

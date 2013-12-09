@@ -9,19 +9,6 @@
 
 #include "config.h"
 
-#ifndef WIN32
-#include <dlfcn.h>
-typedef void *dlh_t;
-#else
-#include <winsock2.h>
-#include <windows.h>
-#define dlopen(lib, flags) LoadLibrary(lib)
-#define dlsym(h, sym)  ((void*)GetProcAddress(h, sym))
-#define dlerror()  "unknown"
-#define dlclose(h)  FreeLibrary(h)
-typedef HMODULE dlh_t;
-#endif
-
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -77,10 +64,20 @@ struct mcp2210_device {
 static
 bool mcp2210_io(hid_device * const hid, uint8_t * const cmd, uint8_t * const buf)
 {
-	return likely(
+	char hexcmd[(0x41 * 2) + 1];
+	if (opt_dev_protocol)
+		bin2hex(hexcmd, cmd, 0x41);
+	const bool rv = likely(
 		0x41 == hid_write(hid, cmd, 0x41) &&
 		64 == hid_read(hid, buf, 64)
 	);
+	if (opt_dev_protocol)
+	{
+		char hexbuf[(0x40 * 2) + 1];
+		bin2hex(hexbuf, buf, 0x40);
+		applog(LOG_DEBUG, "mcp2210_io(%p, %s, %s)", hid, hexcmd, hexbuf);
+	}
+	return rv;
 }
 
 static
@@ -107,7 +104,7 @@ bool mcp2210_get_configs(struct mcp2210_device * const h)
 	return true;
 }
 
-struct mcp2210_device *mcp2210_open(struct lowlevel_device_info *info)
+struct mcp2210_device *mcp2210_open(const struct lowlevel_device_info * const info)
 {
 	struct mcp2210_device *h;
 	char * const path = info->path;
@@ -248,6 +245,17 @@ retry:
 			return false;
 		}
 	}
+}
+
+bool mcp2210_spi_cancel(struct mcp2210_device * const h)
+{
+	hid_device * const hid = h->hid;
+	uint8_t cmd[0x41] = {0,0x11}, buf[0x40];
+	
+	if (!mcp2210_io(hid, cmd, buf))
+		return false;
+	
+	return (buf[1] == 0);
 }
 
 static

@@ -15,7 +15,6 @@
 
 #include "deviceapi.h"
 #include "driver-bitfury.h"
-#include "fpgautils.h"
 #include "libbitfury.h"
 #include "logging.h"
 #include "lowlevel.h"
@@ -55,6 +54,8 @@ bool nanofury_spi_reset(struct mcp2210_device * const mcp)
 	return true;
 }
 
+static void nanofury_device_off(struct mcp2210_device *);
+
 static
 bool nanofury_spi_txrx(struct spi_port * const port)
 {
@@ -73,7 +74,7 @@ bool nanofury_spi_txrx(struct spi_port * const port)
 	while (bufsz >= NANOFURY_MAX_BYTES_PER_SPI_TRANSFER)
 	{
 		if (!mcp2210_spi_transfer(mcp, ptrwrbuf, ptrrdbuf, NANOFURY_MAX_BYTES_PER_SPI_TRANSFER))
-			return false;
+			goto err;
 		ptrrdbuf += NANOFURY_MAX_BYTES_PER_SPI_TRANSFER;
 		ptrwrbuf += NANOFURY_MAX_BYTES_PER_SPI_TRANSFER;
 		bufsz -= NANOFURY_MAX_BYTES_PER_SPI_TRANSFER;
@@ -83,10 +84,16 @@ bool nanofury_spi_txrx(struct spi_port * const port)
 	if (bufsz > 0)
 	{
 		if (!mcp2210_spi_transfer(mcp, ptrwrbuf, ptrrdbuf, bufsz))
-			return false;
+			goto err;
 	}
 	
 	return true;
+
+err:
+	mcp2210_spi_cancel(mcp);
+	nanofury_device_off(mcp);
+	hashes_done2(thr, -1, NULL);
+	return false;
 }
 
 static
@@ -118,6 +125,9 @@ bool nanofury_checkport(struct mcp2210_device * const mcp)
 	// PWR_EN
 	if (!mcp2210_set_gpio_output(mcp, NANOFURY_GP_PIN_PWR_EN, MGV_HIGH))
 		goto fail;
+	
+	// cancel any outstanding SPI transfers
+	mcp2210_spi_cancel(mcp);
 	
 	// configure SPI
 	// This is the only place where speed, mode and other settings are configured!!!
@@ -162,7 +172,13 @@ fail:
 }
 
 static
-bool nanofury_foundlowl(struct lowlevel_device_info * const info, __maybe_unused void *userp)
+bool nanofury_lowl_match(const struct lowlevel_device_info * const info)
+{
+	return lowlevel_match_lowlproduct(info, &lowl_mcp2210, NANOFURY_USB_PRODUCT);
+}
+
+static
+bool nanofury_lowl_probe(const struct lowlevel_device_info * const info)
 {
 	const char * const product = info->product;
 	const char * const serial = info->serial;
@@ -171,7 +187,7 @@ bool nanofury_foundlowl(struct lowlevel_device_info * const info, __maybe_unused
 	if (info->lowl != &lowl_mcp2210)
 	{
 		if (info->lowl != &lowl_hid && info->lowl != &lowl_usb)
-			applog(LOG_WARNING, "%s: Matched \"%s\" serial \"%s\", but lowlevel driver is not mcp2210!",
+			applog(LOG_DEBUG, "%s: Matched \"%s\" serial \"%s\", but lowlevel driver is not mcp2210!",
 			       __func__, product, serial);
 		return false;
 	}
@@ -193,14 +209,14 @@ bool nanofury_foundlowl(struct lowlevel_device_info * const info, __maybe_unused
 	nanofury_device_off(mcp);
 	mcp2210_close(mcp);
 	
-	if (bfg_claim_hid(&nanofury_drv, true, info->path))
+	if (lowlevel_claim(&nanofury_drv, true, info))
 		return false;
 	
 	struct cgpu_info *cgpu;
 	cgpu = malloc(sizeof(*cgpu));
 	*cgpu = (struct cgpu_info){
 		.drv = &nanofury_drv,
-		.device_data = info,
+		.device_data = lowlevel_ref(info),
 		.threads = 1,
 		// TODO: .name
 		.device_path = strdup(info->path),
@@ -212,21 +228,6 @@ bool nanofury_foundlowl(struct lowlevel_device_info * const info, __maybe_unused
 	};
 
 	return add_cgpu(cgpu);
-}
-
-static bool nanofury_detect_one(const char *serial)
-{
-	return lowlevel_detect_serial(nanofury_foundlowl, serial);
-}
-
-static int nanofury_detect_auto()
-{
-	return lowlevel_detect(nanofury_foundlowl, NANOFURY_USB_PRODUCT);
-}
-
-static void nanofury_detect()
-{
-	serial_detect_auto(&nanofury_drv, nanofury_detect_one, nanofury_detect_auto);
 }
 
 static
@@ -303,21 +304,35 @@ void nanofury_enable(struct thr_info * const thr)
 }
 
 static
+void nanofury_reinit(struct cgpu_info * const cgpu)
+{
+	struct thr_info * const thr = cgpu->thr[0];
+	struct mcp2210_device * const mcp = thr->cgpu_data;
+	
+	nanofury_device_off(mcp);
+	cgsleep_ms(1);
+	nanofury_enable(thr);
+}
+
+static
 void nanofury_shutdown(struct thr_info * const thr)
 {
 	struct mcp2210_device * const mcp = thr->cgpu_data;
 	
-	nanofury_device_off(mcp);
+	if (mcp)
+		nanofury_device_off(mcp);
 }
 
 struct device_drv nanofury_drv = {
 	.dname = "nanofury",
 	.name = "NFY",
-	.drv_detect = nanofury_detect,
+	.lowl_match = nanofury_lowl_match,
+	.lowl_probe = nanofury_lowl_probe,
 	
 	.thread_init = nanofury_init,
 	.thread_disable = nanofury_disable,
 	.thread_enable = nanofury_enable,
+	.reinit_device = nanofury_reinit,
 	.thread_shutdown = nanofury_shutdown,
 	
 	.minerloop = minerloop_async,

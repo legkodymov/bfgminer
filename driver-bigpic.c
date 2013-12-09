@@ -18,10 +18,11 @@
 #include <stdint.h>
 
 #include "miner.h"
-#include "fpgautils.h"
 #include "logging.h"
 
 #include "libbitfury.h"
+#include "lowlevel.h"
+#include "lowl-vcom.h"
 #include "deviceapi.h"
 #include "sha2.h"
 
@@ -30,6 +31,12 @@
 #include <stdio.h>
 
 BFG_REGISTER_DRIVER(bigpic_drv)
+
+static
+bool bigpic_lowl_match(const struct lowlevel_device_info * const info)
+{
+	return lowlevel_match_product(info, "Bitfury", "BF1");
+}
 
 //------------------------------------------------------------------------------
 static bool bigpic_detect_custom(const char *devpath, struct device_drv *api, struct bigpic_info *info)
@@ -48,6 +55,7 @@ static bool bigpic_detect_custom(const char *devpath, struct device_drv *api, st
 	{
 		applog(LOG_ERR, "%s: Failed writing id request to %s",
 		       bigpic_drv.dname, devpath);
+		serial_close(fd);
 		return false;
 	}
 	len = serial_read(fd, buf, sizeof(buf));
@@ -60,6 +68,7 @@ static bool bigpic_detect_custom(const char *devpath, struct device_drv *api, st
 	info->id.version = buf[1];
 	memcpy(info->id.product, buf+2, 8);
 	memcpy(&info->id.serial, buf+10, 4);
+	info->id.serial = le32toh(info->id.serial);
 	applog(LOG_DEBUG, "%s: %s: %d, %s %08x",
 	       bigpic_drv.dname,
 	       devpath,
@@ -71,11 +80,12 @@ static bool bigpic_detect_custom(const char *devpath, struct device_drv *api, st
 	{
 		applog(LOG_ERR, "%s: Failed writing reset request to %s",
 		       bigpic_drv.dname, devpath);
+		serial_close(fd);
 		return false;
 	}
 
-
-	while(len == 0)
+	int limit = 50;
+	while (len == 0 && --limit)
 	{
 		len = serial_read(fd, buf, sizeof(buf_state));
 		cgsleep_ms(100);
@@ -128,16 +138,10 @@ static bool bigpic_detect_one(const char *devpath)
 	return true;
 }
 
-//------------------------------------------------------------------------------
-static int bigpic_detect_auto(void)
+static
+bool bigpic_lowl_probe(const struct lowlevel_device_info * const info)
 {
-	return serial_autodetect(bigpic_detect_one, "Bitfury_BF1");
-}
-
-//------------------------------------------------------------------------------
-static void bigpic_detect()
-{
-	serial_detect_auto(&bigpic_drv, bigpic_detect_one, bigpic_detect_auto);
+	return vcom_lowl_probe_wrapper(info, bigpic_detect_one);
 }
 
 //------------------------------------------------------------------------------
@@ -187,6 +191,7 @@ static void bigpic_process_results(struct thr_info *thr, struct work *work)
 
 	uint32_t results[16*6];
 	uint32_t num_results;
+	int hwe = 0;
 
 	uint32_t m7    = *((uint32_t *)&work->data[64]);
 	uint32_t ntime = *((uint32_t *)&work->data[68]);
@@ -203,6 +208,7 @@ static void bigpic_process_results(struct thr_info *thr, struct work *work)
 		if(duplicate(results, num_results, state.nonce))
 			continue;
 
+		state.nonce = le32toh(state.nonce);
 		uint32_t nonce = bitfury_decnonce(state.nonce);
 		results[num_results++] = state.nonce;
 
@@ -212,6 +218,7 @@ static void bigpic_process_results(struct thr_info *thr, struct work *work)
 		if (bitfury_fudge_nonce(work->midstate, m7, ntime, nbits, &nonce))
 			submit_nonce(thr, work, nonce);
 		else
+		if (info->rx_buffer[i + 3] != '\xe0' || hwe++)
 			inc_hw_errors(thr, work, nonce);
 	}
 }
@@ -312,7 +319,8 @@ struct device_drv bigpic_drv = {
 	.name = "BPM",
 	.probe_priority = -110,
 
-	.drv_detect = bigpic_detect,
+	.lowl_match = bigpic_lowl_match,
+	.lowl_probe = bigpic_lowl_probe,
 
 	.identify_device = bigpic_identify,
 

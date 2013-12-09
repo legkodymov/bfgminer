@@ -175,10 +175,8 @@ int stratumsrv_port = -1;
 struct string_elist *scan_devices;
 static struct string_elist *opt_set_device_list;
 bool opt_force_dev_init;
-static bool devices_enabled[MAX_DEVICES];
-static int opt_devs_enabled;
+static struct string_elist *opt_devices_enabled_list;
 static bool opt_display_devs;
-static bool opt_removedisabled;
 int total_devices;
 struct cgpu_info **devices;
 int total_devices_new;
@@ -222,6 +220,9 @@ bool opt_worktime;
 #ifdef USE_AVALON
 char *opt_avalon_options = NULL;
 #endif
+#ifdef USE_KLONDIKE
+char *opt_klondike_options = NULL;
+#endif
 
 char *opt_kernel_path;
 char *cgminer_path;
@@ -234,7 +235,6 @@ bool opt_bfl_noncerange;
 struct thr_info *control_thr;
 struct thr_info **mining_thr;
 static int gwsched_thr_id;
-static int stage_thr_id;
 static int watchpool_thr_id;
 static int watchdog_thr_id;
 #ifdef HAVE_CURSES
@@ -325,6 +325,10 @@ const char unicode_micro = 'u';
 #endif
 
 #ifdef HAVE_CURSES
+#define U8_BAD_START "\xef\x80\x81"
+#define U8_BAD_END   "\xef\x80\x80"
+#define AS_BAD(x) U8_BAD_START x U8_BAD_END
+
 bool selecting_device;
 unsigned selected_device;
 #endif
@@ -495,53 +499,190 @@ static void applog_and_exit(const char *fmt, ...)
 	exit(1);
 }
 
+char *devpath_to_devid(const char *devpath)
+{
+#ifndef WIN32
+	struct stat my_stat;
+	if (stat(devpath, &my_stat))
+		return NULL;
+	char *devs = malloc(6 + (sizeof(dev_t) * 2) + 1);
+	memcpy(devs, "dev_t:", 6);
+	bin2hex(&devs[6], &my_stat.st_rdev, sizeof(dev_t));
+#else
+	if (!strncmp(devpath, "\\\\.\\", 4))
+		devpath += 4;
+	if (strncasecmp(devpath, "COM", 3) || !devpath[3])
+		return NULL;
+	devpath += 3;
+	char *p;
+	strtol(devpath, &p, 10);
+	if (p[0])
+		return NULL;
+	const int sz = (p - devpath);
+	char *devs = malloc(4 + sz + 1);
+	sprintf(devs, "com:%s", devpath);
+#endif
+	return devs;
+}
+
+static
+bool devpaths_match(const char * const ap, const char * const bp)
+{
+	char * const a = devpath_to_devid(ap);
+	if (!a)
+		return false;
+	char * const b = devpath_to_devid(bp);
+	bool rv = false;
+	if (b)
+	{
+		rv = !strcmp(a, b);
+		free(b);
+	}
+	free(a);
+	return rv;
+}
+
+static
+int proc_letter_to_number(const char *s, const char ** const rem)
+{
+	int n = 0, c;
+	for ( ; s[0]; ++s)
+	{
+		if (unlikely(n > INT_MAX / 26))
+			break;
+		c = tolower(s[0]) - 'a';
+		if (unlikely(c < 0 || c > 25))
+			break;
+		if (unlikely(INT_MAX - c < n))
+			break;
+		n = (n * 26) + c;
+	}
+	*rem = s;
+	return n;
+}
+
 static
 bool cgpu_match(const char * const pattern, const struct cgpu_info * const cgpu)
 {
 	// all - matches anything
 	// d0 - matches all processors of device 0
+	// d0-3 - matches all processors of device 0, 1, 2, or 3
 	// d0a - matches first processor of device 0
 	// 0 - matches processor 0
+	// 0-4 - matches processors 0, 1, 2, 3, or 4
 	// ___ - matches all processors on all devices using driver/name ___
 	// ___0 - matches all processors of 0th device using driver/name ___
 	// ___0a - matches first processor of 0th device using driver/name ___
+	// @* - matches device with serial or path *
+	// @*@a - matches first processor of device with serial or path *
+	// ___@* - matches device with serial or path * using driver/name ___
 	if (!strcasecmp(pattern, "all"))
 		return true;
 	
 	const char *p = pattern, *p2;
 	size_t L;
 	int n, i, c = -1;
+	int n2;
+	int proc_first = -1, proc_last = -1;
 	struct cgpu_info *device;
 	
-	while (p[0] && !isdigit(p[0]))
+	while (p[0] && p[0] != '@' && p[0] != '-' && !isdigit(p[0]))
 		++p;
 	
 	L = p - pattern;
 	while (L && isspace(pattern[L-1]))
 		--L;
-	n = strtol(p, (void*)&p2, 0);
-	if (L == 0)
+	if (p[0] == '@')
 	{
-		if (!p[0])
-			return true;
-		if (p2 && p2[0])
-			goto invsyntax;
-		if (n >= total_devices)
+		// Serial/path
+		const char * const ser = &p[1];
+		for (p = ser; p[0] != '@' && p[0] != '\0'; ++p)
+		{}
+		p2 = (p[0] == '@') ? &p[1] : p;
+		const size_t serlen = (p - ser);
+		p = "";
+		n = n2 = 0;
+		const char * const devpath = cgpu->device_path ?: "";
+		const char * const devser = cgpu->dev_serial ?: "";
+		if ((!strncmp(devpath, ser, serlen)) && devpath[serlen] == '\0')
+		{}  // Match
+		else
+		if ((!strncmp(devser, ser, serlen)) && devser[serlen] == '\0')
+		{}  // Match
+		else
+		{
+			char devpath2[serlen + 1];
+			memcpy(devpath2, ser, serlen);
+			devpath2[serlen] = '\0';
+			if (!devpaths_match(devpath, ser))
+				return false;
+		}
+	}
+	else
+	{
+		if (isdigit(p[0]))
+			n = strtol(p, (void*)&p2, 0);
+		else
+		{
+			n = 0;
+			p2 = p;
+		}
+		if (p2[0] == '-')
+		{
+			++p2;
+			if (p2[0] && isdigit(p2[0]))
+				n2 = strtol(p2, (void*)&p2, 0);
+			else
+				n2 = INT_MAX;
+		}
+		else
+			n2 = n;
+		if (p == pattern)
+		{
+			if (!p[0])
+				return true;
+			if (p2 && p2[0])
+				goto invsyntax;
+			for (i = n; i <= n2; ++i)
+			{
+				if (i >= total_devices)
+					break;
+				if (cgpu == devices[i])
+					return true;
+			}
 			return false;
-		return (cgpu == devices[n]);
+		}
+	}
+	
+	if (p2[0])
+	{
+		proc_first = proc_letter_to_number(&p2[0], &p2);
+		if (p2[0] == '-')
+		{
+			++p2;
+			if (p2[0])
+				proc_last = proc_letter_to_number(p2, &p2);
+			else
+				proc_last = INT_MAX;
+		}
+		else
+			proc_last = proc_first;
+		if (p2[0])
+			goto invsyntax;
 	}
 	
 	if (L > 1 || tolower(pattern[0]) != 'd' || !p[0])
 	{
 		const struct device_drv * const drv = cgpu->drv;
 		if ((L == 3 && !strncasecmp(pattern, drv->name, 3)) ||
+			(!L) ||
 			(L == strlen(drv->dname) && !strncasecmp(pattern, drv->dname, L)))
 			{}  // Matched name or dname
 		else
 			return false;
-		if (p[0] && n != cgpu->device_id)
+		if (p[0] && (cgpu->device_id < n || cgpu->device_id > n2))
 			return false;
-		if (p2[0] && strcasecmp(p2, &cgpu->proc_repr[5]))
+		if (proc_first != -1 && (cgpu->proc_id < proc_first || cgpu->proc_id > proc_last))
 			return false;
 		return true;
 	}
@@ -555,21 +696,123 @@ bool cgpu_match(const char * const pattern, const struct cgpu_info * const cgpu)
 			return false;
 		if (devices[i]->device != devices[i])
 			continue;
-		if (++c == n)
-			break;
-	}
-	for (device = devices[i]; device; device = device->next_proc)
-	{
-		if (p2 && p2[0] && strcasecmp(p2, &cgpu->proc_repr[5]))
+		++c;
+		if (c < n)
 			continue;
-		if (device == cgpu)
-			return true;
+		if (c > n2)
+			break;
+		
+		for (device = devices[i]; device; device = device->next_proc)
+		{
+			if (proc_first != -1 && (device->proc_id < proc_first || device->proc_id > proc_last))
+				continue;
+			if (device == cgpu)
+				return true;
+		}
 	}
 	return false;
 
 invsyntax:
 	applog(LOG_WARNING, "%s: Invalid syntax: %s", __func__, pattern);
 	return false;
+}
+
+#define TEST_CGPU_MATCH(pattern)  \
+	if (!cgpu_match(pattern, &cgpu))  \
+		applog(LOG_ERR, "%s: Pattern \"%s\" should have matched!", __func__, pattern);  \
+// END TEST_CGPU_MATCH
+#define TEST_CGPU_NOMATCH(pattern)  \
+	if (cgpu_match(pattern, &cgpu))  \
+		applog(LOG_ERR, "%s: Pattern \"%s\" should NOT have matched!", __func__, pattern);  \
+// END TEST_CGPU_MATCH
+static __maybe_unused
+void test_cgpu_match()
+{
+	struct device_drv drv = {
+		.dname = "test",
+		.name = "TST",
+	};
+	struct cgpu_info cgpu = {
+		.drv = &drv,
+		.device = &cgpu,
+		.device_id = 1,
+		.proc_id = 1,
+		.proc_repr = "TST 1b",
+	}, cgpu0a = {
+		.drv = &drv,
+		.device = &cgpu0a,
+		.device_id = 0,
+		.proc_id = 0,
+		.proc_repr = "TST 0a",
+	}, cgpu1a = {
+		.drv = &drv,
+		.device = &cgpu0a,
+		.device_id = 1,
+		.proc_id = 0,
+		.proc_repr = "TST 1a",
+	};
+	struct cgpu_info *devices_list[3] = {&cgpu0a, &cgpu1a, &cgpu,};
+	devices = devices_list;
+	total_devices = 3;
+	TEST_CGPU_MATCH("all")
+	TEST_CGPU_MATCH("d1")
+	TEST_CGPU_NOMATCH("d2")
+	TEST_CGPU_MATCH("d0-5")
+	TEST_CGPU_NOMATCH("d0-0")
+	TEST_CGPU_NOMATCH("d2-5")
+	TEST_CGPU_MATCH("d-1")
+	TEST_CGPU_MATCH("d1-")
+	TEST_CGPU_NOMATCH("d-0")
+	TEST_CGPU_NOMATCH("d2-")
+	TEST_CGPU_MATCH("2")
+	TEST_CGPU_NOMATCH("3")
+	TEST_CGPU_MATCH("1-2")
+	TEST_CGPU_MATCH("2-3")
+	TEST_CGPU_NOMATCH("1-1")
+	TEST_CGPU_NOMATCH("3-4")
+	TEST_CGPU_MATCH("TST")
+	TEST_CGPU_NOMATCH("TSF")
+	TEST_CGPU_NOMATCH("TS")
+	TEST_CGPU_NOMATCH("TSTF")
+	TEST_CGPU_MATCH("TST1")
+	TEST_CGPU_MATCH("TST0-1")
+	TEST_CGPU_MATCH("TST 1")
+	TEST_CGPU_MATCH("TST 1-2")
+	TEST_CGPU_NOMATCH("TST2")
+	TEST_CGPU_NOMATCH("TST2-3")
+	TEST_CGPU_NOMATCH("TST0-0")
+	TEST_CGPU_MATCH("TST1b")
+	TEST_CGPU_NOMATCH("TST1c")
+	TEST_CGPU_NOMATCH("TST1bb")
+	TEST_CGPU_MATCH("TST0-1b")
+	TEST_CGPU_NOMATCH("TST0-1c")
+	TEST_CGPU_MATCH("TST1a-d")
+	TEST_CGPU_NOMATCH("TST1a-a")
+	TEST_CGPU_NOMATCH("TST1-a")
+	TEST_CGPU_NOMATCH("TST1c-z")
+	TEST_CGPU_NOMATCH("TST1c-")
+	TEST_CGPU_MATCH("@")
+	TEST_CGPU_NOMATCH("@abc")
+	TEST_CGPU_MATCH("@@b")
+	TEST_CGPU_NOMATCH("@@c")
+	TEST_CGPU_MATCH("TST@")
+	TEST_CGPU_NOMATCH("TST@abc")
+	TEST_CGPU_MATCH("TST@@b")
+	TEST_CGPU_NOMATCH("TST@@c")
+	TEST_CGPU_MATCH("TST@@b-f")
+	TEST_CGPU_NOMATCH("TST@@c-f")
+	TEST_CGPU_NOMATCH("TST@@-a")
+	cgpu.device_path = "/dev/test";
+	cgpu.dev_serial = "testy";
+	TEST_CGPU_MATCH("TST@/dev/test")
+	TEST_CGPU_MATCH("TST@testy")
+	TEST_CGPU_NOMATCH("TST@")
+	TEST_CGPU_NOMATCH("TST@/dev/test5@b")
+	TEST_CGPU_NOMATCH("TST@testy3@b")
+	TEST_CGPU_MATCH("TST@/dev/test@b")
+	TEST_CGPU_MATCH("TST@testy@b")
+	TEST_CGPU_NOMATCH("TST@/dev/test@c")
+	TEST_CGPU_NOMATCH("TST@testy@c")
 }
 
 static
@@ -887,9 +1130,9 @@ char *set_request_diff(const char *arg, float *p)
 	return NULL;
 }
 
+#ifdef NEED_BFG_LOWL_VCOM
 extern struct lowlevel_device_info *_vcom_devinfo_findorcreate(struct lowlevel_device_info **, const char *);
 
-#ifdef FPGAUTILS_H
 #ifdef WIN32
 void _vcom_devinfo_scan_querydosdevice(struct lowlevel_device_info ** const devinfo_list)
 {
@@ -954,12 +1197,6 @@ trydev:
 static char *add_serial(const char *arg)
 {
 	string_elist_add(arg, &scan_devices);
-	return NULL;
-}
-
-static char *compat_disable_gpu(__maybe_unused void *arg)
-{
-	string_elist_add("opencl:noauto", &scan_devices);
 	return NULL;
 }
 
@@ -1048,9 +1285,6 @@ void test_intrange()
 
 static char *set_devices(char *arg)
 {
-	int i, val1 = 0, val2 = 0;
-	char *nextptr;
-
 	if (*arg) {
 		if (*arg == '?') {
 			opt_display_devs = true;
@@ -1059,34 +1293,7 @@ static char *set_devices(char *arg)
 	} else
 		return "Invalid device parameters";
 
-	nextptr = strtok(arg, ",");
-	if (nextptr == NULL)
-		return "Invalid parameters for set devices";
-	if (!get_intrange(nextptr, &val1, &val2))
-		return "Invalid device number";
-	if (val1 < 0 || val1 > MAX_DEVICES || val2 < 0 || val2 > MAX_DEVICES ||
-	    val1 > val2) {
-		return "Invalid value passed to set devices";
-	}
-
-	for (i = val1; i <= val2; i++) {
-		devices_enabled[i] = true;
-		opt_devs_enabled++;
-	}
-
-	while ((nextptr = strtok(NULL, ",")) != NULL) {
-		if (!get_intrange(nextptr, &val1, &val2))
-			return "Invalid device number";
-		if (val1 < 0 || val1 > MAX_DEVICES || val2 < 0 || val2 > MAX_DEVICES ||
-		val1 > val2) {
-			return "Invalid value passed to set devices";
-		}
-
-		for (i = val1; i <= val2; i++) {
-			devices_enabled[i] = true;
-			opt_devs_enabled++;
-		}
-	}
+	string_elist_add(arg, &opt_devices_enabled_list);
 
 	return NULL;
 }
@@ -1554,6 +1761,15 @@ static char *set_avalon_options(const char *arg)
 }
 #endif
 
+#ifdef USE_KLONDIKE
+static char *set_klondike_options(const char *arg)
+{
+	opt_set_charp(arg, &opt_klondike_options);
+
+	return NULL;
+}
+#endif
+
 __maybe_unused
 static char *set_null(const char __maybe_unused *arg)
 {
@@ -1701,11 +1917,7 @@ static struct opt_table opt_config_table[] = {
 			"Verbose dump of device protocol-level activities"),
 	OPT_WITH_ARG("--device|-d",
 		     set_devices, NULL, NULL,
-	             "Select device to use, one value, range and/or comma separated (e.g. 0-2,4) default: all"),
-	OPT_WITHOUT_ARG("--disable-gpu|-G",
-			compat_disable_gpu, NULL,
-			opt_hidden
-	),
+	             "Enable only devices matching pattern (default: all)"),
 	OPT_WITHOUT_ARG("--disable-rejecting",
 			opt_set_bool, &opt_disable_pool,
 			"Automatically disable pools that continually reject shares"),
@@ -1809,6 +2021,11 @@ static struct opt_table opt_config_table[] = {
 		     set_avalon_options, NULL, NULL,
 		     opt_hidden),
 #endif
+#ifdef USE_KLONDIKE
+	OPT_WITH_ARG("--klondike-options",
+		     set_klondike_options, NULL, NULL,
+		     "Set klondike options clock:temptarget"),
+#endif
 	OPT_WITHOUT_ARG("--load-balance",
 		     set_loadbalance, &pool_strategy,
 		     "Change multipool strategy from failover to quota based balance"),
@@ -1831,7 +2048,7 @@ static struct opt_table opt_config_table[] = {
 #endif // defined(unix)
 	OPT_WITHOUT_ARG("--net-delay",
 			opt_set_bool, &opt_delaynet,
-			"Impose small delays in networking to not overload slow routers"),
+			"Impose small delays in networking to avoid overloading slow routers"),
 	OPT_WITHOUT_ARG("--no-adl",
 			opt_set_bool, &opt_noadl,
 #ifdef HAVE_ADL
@@ -1891,6 +2108,9 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITHOUT_ARG("--per-device-stats",
 			opt_set_bool, &want_per_device_stats,
 			"Force verbose mode and output per-device statistics"),
+	OPT_WITH_ARG("--userpass|-O",  // duplicate to ensure config loads it before pool-priority
+	             set_userpass, NULL, NULL,
+	             opt_hidden),
 	OPT_WITH_ARG("--pool-priority",
 			 set_pool_priority, NULL, NULL,
 			 "Priority for just the previous-defined pool"),
@@ -1918,9 +2138,6 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITHOUT_ARG("--real-quiet",
 			opt_set_bool, &opt_realquiet,
 			"Disable all output"),
-	OPT_WITHOUT_ARG("--remove-disabled",
-		     opt_set_bool, &opt_removedisabled,
-	         "Remove disabled devices entirely, as if they didn't exist"),
 	OPT_WITH_ARG("--request-diff",
 	             set_request_diff, opt_show_floatval, &request_pdiff,
 	             "Request a specific difficulty from pools"),
@@ -1936,9 +2153,12 @@ static struct opt_table opt_config_table[] = {
 	OPT_WITHOUT_ARG("--round-robin",
 		     set_rr, &pool_strategy,
 		     "Change multipool strategy from failover to round robin on failure"),
-	OPT_WITH_ARG("--scan-serial|-S",
+	OPT_WITH_ARG("--scan|-S",
 		     add_serial, NULL, NULL,
-		     "Serial port to probe for mining devices"),
+		     "Configure how to scan for mining devices"),
+	OPT_WITH_ARG("--scan-device|--scan-serial|--devscan",
+		     add_serial, NULL, NULL,
+		     opt_hidden),
 	OPT_WITH_ARG("--scan-time|-s",
 		     set_int_0_to_9999, opt_show_intval, &opt_scantime,
 		     "Upper bound on time spent scanning current work, in seconds"),
@@ -2253,7 +2473,7 @@ static struct opt_table opt_cmdline_table[] = {
 #ifdef HAVE_OPENCL
 	OPT_WITHOUT_ARG("--ndevs|-n",
 			print_ndevs_and_exit, &nDevs,
-			"Display number of detected GPUs, OpenCL platform information, and exit"),
+			opt_hidden),
 #endif
 	OPT_WITHOUT_ARG("--version|-V",
 			opt_version_and_exit, packagename,
@@ -2453,8 +2673,8 @@ static bool work_decode(struct pool *pool, struct work *work, json_t *val)
 				}
 			} else if (ae >= 3 || opt_coinbase_sig) {
 				const char *cbappend = opt_coinbase_sig;
+				const char full[] = PACKAGE " " VERSION;
 				if (!cbappend) {
-					const char full[] = PACKAGE " " VERSION;
 					if ((size_t)ae >= sizeof(full) - 1)
 						cbappend = full;
 					else if ((size_t)ae >= sizeof(PACKAGE) - 1)
@@ -3050,7 +3270,7 @@ void temperature_column(char *buf, size_t bufsz, bool maybe_unicode, const float
 		maybe_unicode = false;
 	if (temp && *temp > 0.)
 		if (maybe_unicode)
-			snprintf(buf, bufsz, "%4.1f\xb0""C", *temp);
+			snprintf(buf, bufsz, "%4.1f"U8_DEGREE"C", *temp);
 		else
 			snprintf(buf, bufsz, "%4.1fC", *temp);
 	else
@@ -3170,7 +3390,7 @@ void get_statline3(char *buf, size_t bufsz, struct cgpu_info *cgpu, bool for_cur
 #ifdef HAVE_CURSES
 	if (for_curses)
 	{
-		const char *cHrStatsOpt[] = {"\2DEAD \1", "\2SICK \1", "OFF  ", "\2REST \1", " \2ERR \1", "\2WAIT \1", cHr};
+		const char *cHrStatsOpt[] = {AS_BAD("DEAD "), AS_BAD("SICK "), "OFF  ", AS_BAD("REST "), AS_BAD(" ERR "), AS_BAD("WAIT "), cHr};
 		const char *cHrStats;
 		int cHrStatsI = (sizeof(cHrStatsOpt) / sizeof(*cHrStatsOpt)) - 1;
 		bool all_dead = true, all_off = true, all_rdrv = true;
@@ -3261,77 +3481,86 @@ static void text_print_status(int thr_id)
 #ifdef HAVE_CURSES
 static int attr_bad = A_BOLD;
 
+#ifdef WIN32
+#define swprintf snwprintf
+#endif
+
 static
 void bfg_waddstr(WINDOW *win, const char *s)
 {
 	const char *p = s;
-#ifdef USE_UNICODE
-	wchar_t buf[2] = {0, 0};
-#else
-	char buf[1];
-#endif
+	int32_t w;
+	int wlen;
+	unsigned char stop_ascii = (use_unicode ? '|' : 0x80);
 	
-#define PREP_ADDCH  do {  \
-	if (p != s)  \
-		waddnstr(win, s, p - s);  \
-	s = ++p;  \
-}while(0)
 	while (true)
 	{
-next:
-		switch(p[0])
+		while (likely(p[0] == '\n' || (p[0] >= 0x20 && p[0] < stop_ascii)))
 		{
+			// Printable ASCII
+			++p;
+		}
+		if (p != s)
+			waddnstr(win, s, p - s);
+		w = utf8_decode(p, &wlen);
+		if (unlikely(p[0] == '\xb5'))  // HACK for Mu (SI prefix micro-)
+		{
+			w = unicode_micro;
+			wlen = 1;
+		}
+		s = p += wlen;
+		switch(w)
+		{
+			// NOTE: U+F000-U+F7FF are reserved for font hacks
 			case '\0':
-				goto done;
-			default:
-def:
-				++p;
-				goto next;
-			case '\1':
-				PREP_ADDCH;
+				return;
+			case 0xf000:  // "bad" off
 				wattroff(win, attr_bad);
-				goto next;
-			case '\2':
-				PREP_ADDCH;
+				break;
+			case 0xf001:  // "bad" on
 				wattron(win, attr_bad);
-				goto next;
+				break;
 #ifdef USE_UNICODE
 			case '|':
-				if (!use_unicode)
-					goto def;
-				PREP_ADDCH;
 				wadd_wch(win, WACS_VLINE);
-				goto next;
+				break;
 #endif
-			case '\xc1':
-			case '\xc4':
+			case 0x2500:  // BOX DRAWINGS LIGHT HORIZONTAL
+			case 0x2534:  // BOX DRAWINGS LIGHT UP AND HORIZONTAL
 				if (!use_unicode)
 				{
-					buf[0] = '-';
+					waddch(win, '-');
 					break;
 				}
 #ifdef USE_UNICODE
-				PREP_ADDCH;
-				wadd_wch(win, (p[-1] == '\xc4') ? WACS_HLINE : WACS_BTEE);
-				goto next;
-			case '\xb0':  // Degrees symbol
-				buf[0] = ((unsigned char *)p)[0];
+				wadd_wch(win, (w == 0x2500) ? WACS_HLINE : WACS_BTEE);
 				break;
 #endif
-			case '\xb5':  // Mu (SI prefix micro-)
-				buf[0] = unicode_micro;
-		}
-		PREP_ADDCH;
-#ifdef USE_UNICODE
-		waddwstr(win, buf);
-#else
-		waddch(win, buf[0]);
+			case 0x2022:
+				if (w > WCHAR_MAX || !iswprint(w))
+					w = '*';
+			default:
+				if (w > WCHAR_MAX || !(iswprint(w) || w == '\n'))
+				{
+#if REPLACEMENT_CHAR <= WCHAR_MAX
+					if (iswprint(REPLACEMENT_CHAR))
+						w = REPLACEMENT_CHAR;
+					else
 #endif
+						w = '?';
+				}
+				{
+#ifdef USE_UNICODE
+					wchar_t wbuf[0x10];
+					int wbuflen = sizeof(wbuf) / sizeof(*wbuf);
+					wbuflen = swprintf(wbuf, wbuflen, L"%lc", (wint_t)w);
+					waddnwstr(win, wbuf, wbuflen);
+#else
+					wprintw(win, "%lc", (wint_t)w);
+#endif
+				}
+		}
 	}
-done:
-	PREP_ADDCH;
-	return;
-#undef PREP_ADDCH
 }
 
 static inline
@@ -3393,12 +3622,26 @@ static void curses_print_status(const int ts)
 		);
 	}
 	wattroff(statuswin, A_BOLD);
-	wmove(statuswin, 5, 1);
-	bfg_waddstr(statuswin, statusline);
+	
+	wattron(statuswin, menu_attr);
+	cg_mvwprintw(statuswin, 1, 0, " [M]anage devices [P]ool management [S]ettings [D]isplay options  [H]elp [Q]uit ");
+	wattroff(statuswin, menu_attr);
+
+	if ((pool_strategy == POOL_LOADBALANCE  || pool_strategy == POOL_BALANCE) && total_pools > 1) {
+		cg_mvwprintw(statuswin, 2, 0, " Connected to multiple pools with%s block change notify",
+			have_longpoll ? "": "out");
+	} else if (pool->has_stratum) {
+		cg_mvwprintw(statuswin, 2, 0, " Connected to %s diff %s with stratum as user %s",
+			pool->sockaddr_url, pool->diff, pool->rpc_user);
+	} else {
+		cg_mvwprintw(statuswin, 2, 0, " Connected to %s diff %s with%s LP as user %s",
+			pool->sockaddr_url, pool->diff, have_longpoll ? "": "out", pool->rpc_user);
+	}
 	wclrtoeol(statuswin);
-
+	cg_mvwprintw(statuswin, 3, 0, " Block: %s  Diff:%s (%s)  Started: %s",
+		  current_hash, block_diff, net_hashrate, blocktime);
+	
 	income = total_diff_accepted * 3600 * block_subsidy / total_secs / current_diff;
-
 	char bwstr[12], incomestr[13];
 	format_unit3(incomestr, sizeof(incomestr), FUP_BTC, "BTC/hr", H2B_SHORT, income/1e8, -1);
 	cg_mvwprintw(statuswin, 4, 0, " ST:%d  F:%d  NB:%d  AS:%d  BW:[%s]  E:%.2f  I:%s  BS:%s",
@@ -3414,19 +3657,10 @@ static void curses_print_status(const int ts)
 		incomestr,
 		best_share);
 	wclrtoeol(statuswin);
-	if ((pool_strategy == POOL_LOADBALANCE  || pool_strategy == POOL_BALANCE) && total_pools > 1) {
-		cg_mvwprintw(statuswin, 2, 0, " Connected to multiple pools with%s block change notify",
-			have_longpoll ? "": "out");
-	} else if (pool->has_stratum) {
-		cg_mvwprintw(statuswin, 2, 0, " Connected to %s diff %s with stratum as user %s",
-			pool->sockaddr_url, pool->diff, pool->rpc_user);
-	} else {
-		cg_mvwprintw(statuswin, 2, 0, " Connected to %s diff %s with%s LP as user %s",
-			pool->sockaddr_url, pool->diff, have_longpoll ? "": "out", pool->rpc_user);
-	}
+	
+	mvwaddstr(statuswin, 5, 0, " ");
+	bfg_waddstr(statuswin, statusline);
 	wclrtoeol(statuswin);
-	cg_mvwprintw(statuswin, 3, 0, " Block: %s  Diff:%s (%s)  Started: %s",
-		  current_hash, block_diff, net_hashrate, blocktime);
 	
 	logdiv = statusy - 1;
 	bfg_hline(statuswin, 6);
@@ -3446,10 +3680,6 @@ static void curses_print_status(const int ts)
 		mvwadd_wch(statuswin, logdiv, offset, WACS_BTEE);
 	}
 #endif
-	
-	wattron(statuswin, menu_attr);
-	cg_mvwprintw(statuswin, 1, 0, " [M]anage devices [P]ool management [S]ettings [D]isplay options  [H]elp [Q]uit ");
-	wattroff(statuswin, menu_attr);
 }
 
 static void adj_width(int var, int *length)
@@ -3735,6 +3965,7 @@ void maybe_local_submit(const struct work *work)
 			if (likely(!(p && strstr(&p[1], "allblocks"))))
 				continue;
 			
+			applog(LOG_DEBUG, "Attempting submission of full block to pool %d", pools[i]->pool_no);
 			work_cp = copy_work(work);
 			work_cp->pool = pools[i];
 			work_cp->do_foreign_submit = true;
@@ -3777,7 +4008,7 @@ share_result(json_t *val, json_t *res, json_t *err, const struct work *work,
 			share_result_msg(work, "Accepted", "", resubmit, worktime);
 		}
 		sharelog("accept", work);
-		if (opt_shares && total_accepted >= opt_shares) {
+		if (opt_shares && total_diff_accepted >= opt_shares) {
 			applog(LOG_WARNING, "Successfully mined %d accepted shares as requested and exiting.", opt_shares);
 			kill_work();
 			return;
@@ -3988,8 +4219,8 @@ static bool submit_upstream_work_completed(struct work *work, bool resubmit, str
 
 			snprintf(worktime, sizeof(worktime),
 				" <-%08lx.%08lx M:%c D:%1.*f G:%02d:%02d:%02d:%1.3f %s (%1.3f) W:%1.3f (%1.3f) S:%1.3f R:%02d:%02d:%02d",
-				(unsigned long)swab32(*(uint32_t *)&(work->data[opt_scrypt ? 32 : 28])),
-				(unsigned long)swab32(*(uint32_t *)&(work->data[opt_scrypt ? 28 : 24])),
+				(unsigned long)be32toh(*(uint32_t *)&(work->data[opt_scrypt ? 32 : 28])),
+				(unsigned long)be32toh(*(uint32_t *)&(work->data[opt_scrypt ? 28 : 24])),
 				work->getwork_mode, diffplaces, work->work_difficulty,
 				tm_getwork.tm_hour, tm_getwork.tm_min,
 				tm_getwork.tm_sec, getwork_time, workclone,
@@ -4523,11 +4754,7 @@ static void __kill_work(void)
 		cgpu->status = LIFE_DEAD2;
 	}
 
-	applog(LOG_DEBUG, "Killing off stage thread");
 	/* Stop the others */
-	thr = &control_thr[stage_thr_id];
-	thr_info_cancel(thr);
-
 	applog(LOG_DEBUG, "Killing off API thread");
 	thr = &control_thr[api_thr_id];
 	thr_info_cancel(thr);
@@ -4549,14 +4776,14 @@ const
 #endif
 char **initial_args;
 
-void _bfg_clean_up(void);
+void _bfg_clean_up(bool);
 
 void app_restart(void)
 {
 	applog(LOG_WARNING, "Attempting to restart %s", packagename);
 
 	__kill_work();
-	_bfg_clean_up();
+	_bfg_clean_up(true);
 
 #if defined(unix) || defined(__APPLE__)
 	if (forkpid > 0) {
@@ -4736,7 +4963,7 @@ static void roll_work(struct work *work)
 
 /* Duplicates any dynamically allocated arrays within the work struct to
  * prevent a copied work struct from freeing ram belonging to another struct */
-void __copy_work(struct work *work, const struct work *base_work)
+static void _copy_work(struct work *work, const struct work *base_work, int noffset)
 {
 	int id = work->id;
 
@@ -4757,6 +4984,15 @@ void __copy_work(struct work *work, const struct work *base_work)
 		++*work->tmpl_refcount;
 		mutex_unlock(&pool->pool_lock);
 	}
+	
+	if (noffset)
+	{
+		uint32_t *work_ntime = (uint32_t *)(work->data + 68);
+		uint32_t ntime = be32toh(*work_ntime);
+
+		ntime += noffset;
+		*work_ntime = htobe32(ntime);
+	}
 }
 
 /* Generates a copy of an existing work struct, creating fresh heap allocations
@@ -4765,9 +5001,14 @@ struct work *copy_work(const struct work *base_work)
 {
 	struct work *work = make_work();
 
-	__copy_work(work, base_work);
+	_copy_work(work, base_work, 0);
 
 	return work;
+}
+
+void __copy_work(struct work *work, const struct work *base_work)
+{
+	_copy_work(work, base_work, 0);
 }
 
 static struct work *make_clone(struct work *work)
@@ -4800,6 +5041,7 @@ static bool clone_available(void)
 		if (can_roll(work) && should_roll(work)) {
 			roll_work(work);
 			work_clone = make_clone(work);
+			applog(LOG_DEBUG, "%s: Rolling work %d to %d", __func__, work->id, work_clone->id);
 			roll_work(work);
 			cloned = true;
 			break;
@@ -5584,8 +5826,11 @@ void switch_pools(struct pool *selected)
 static void discard_work(struct work *work)
 {
 	if (!work->clone && !work->rolls && !work->mined) {
-		if (work->pool)
+		if (work->pool) {
 			work->pool->discarded_work++;
+			work->pool->quota_used--;
+			work->pool->works--;
+		}
 		total_discarded++;
 		applog(LOG_DEBUG, "Discarded work");
 	} else
@@ -5890,51 +6135,15 @@ static bool hash_push(struct work *work)
 	return rc;
 }
 
-static void *stage_thread(void *userdata)
-{
-	struct thr_info *mythr = userdata;
-	bool ok = true;
-
-#ifndef HAVE_PTHREAD_CANCEL
-	pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
-#endif
-
-	RenameThread("stage");
-
-	while (ok) {
-		struct work *work = NULL;
-
-		applog(LOG_DEBUG, "Popping work to stage thread");
-
-		work = tq_pop(mythr->q, NULL);
-		if (unlikely(!work)) {
-			applog(LOG_ERR, "Failed to tq_pop in stage_thread");
-			ok = false;
-			break;
-		}
-		work->work_restart_id = work->pool->work_restart_id;
-
-		test_work_current(work);
-
-		applog(LOG_DEBUG, "Pushing work to getwork queue (queued=%c)", work->queued?'Y':'N');
-
-		if (unlikely(!hash_push(work))) {
-			applog(LOG_WARNING, "Failed to hash_push in stage_thread");
-			continue;
-		}
-	}
-
-	tq_freeze(mythr->q);
-	return NULL;
-}
-
 static void stage_work(struct work *work)
 {
-	applog(LOG_DEBUG, "Pushing work from pool %d to hash queue", work->pool->pool_no);
+	applog(LOG_DEBUG, "Pushing work %d from pool %d to hash queue",
+	       work->id, work->pool->pool_no);
 	work->work_restart_id = work->pool->work_restart_id;
 	work->pool->last_work_time = time(NULL);
 	cgtime(&work->pool->tv_last_work_time);
 	test_work_current(work);
+	work->pool->works++;
 	hash_push(work);
 }
 
@@ -5945,6 +6154,8 @@ int curses_int(const char *query)
 	char *cvar;
 
 	cvar = curses_input(query);
+	if (unlikely(!cvar))
+		return -1;
 	ret = atoi(cvar);
 	free(cvar);
 	return ret;
@@ -5989,6 +6200,7 @@ static void display_pool_summary(struct pool *pool)
 		efficiency = pool_bytes_xfer ? pool->diff_accepted * 2048. / pool_bytes_xfer : 0.0;
 		wlog(" Efficiency (accepted * difficulty / 2 KB): %.2f\n", efficiency);
 
+		wlog(" Items worked on: %d\n", pool->works);
 		wlog(" Stale submissions discarded due to new blocks: %d\n", pool->stale_shares);
 		wlog(" Unable to get work from server occasions: %d\n", pool->getfail_occasions);
 		wlog(" Submitting work remotely delay occasions: %d\n\n", pool->remotefail_occasions);
@@ -6044,7 +6256,8 @@ static void json_escape_free()
 	}
 }
 
-static char *json_escape(char *str)
+static
+char *json_escape(const char *str)
 {
 	struct JE *jeptr;
 	char *buf, *ptr;
@@ -6120,6 +6333,24 @@ void _write_config_temps(FILE *fcfg, const char *configname, size_t settingoffse
 }
 #define write_config_temps(fcfg, configname, settingname)  \
 	_write_config_temps(fcfg, configname, offsetof(struct cgpu_info, settingname), offsetof(struct cgpu_info, settingname ## _default))
+
+static
+void _write_config_string_elist(FILE *fcfg, const char *configname, struct string_elist * const elist)
+{
+	if (!elist)
+		return;
+	
+	static struct string_elist *entry;
+	fprintf(fcfg, ",\n\"%s\" : [", configname);
+	bool first = true;
+	DL_FOREACH(elist, entry)
+	{
+		const char * const s = entry->string;
+		fprintf(fcfg, "%s\n\t\"%s\"", first ? "" : ",", json_escape(s));
+		first = false;
+	}
+	fprintf(fcfg, "\n]");
+}
 
 void write_config(FILE *fcfg)
 {
@@ -6301,41 +6532,9 @@ void write_config(FILE *fcfg)
 	if (opt_socks_proxy && *opt_socks_proxy)
 		fprintf(fcfg, ",\n\"socks-proxy\" : \"%s\"", json_escape(opt_socks_proxy));
 	
-	// We can only remove devices or disable them by default, but not both...
-	if (!(opt_removedisabled && opt_devs_enabled))
-	{
-		// Don't need to remove any, so we can set defaults here
-		for (i = 0; i < total_devices; ++i)
-			if (devices[i]->deven == DEV_DISABLED)
-			{
-				// At least one device is in fact disabled, so include device params
-				fprintf(fcfg, ",\n\"device\" : [");
-				bool first = true;
-				for (i = 0; i < total_devices; ++i)
-					if (devices[i]->deven != DEV_DISABLED)
-					{
-						fprintf(fcfg, "%s\n\t%d", first ? "" : ",", i);
-						first = false;
-					}
-				fprintf(fcfg, "\n]");
-				
-				break;
-			}
-	}
-	else
-	if (opt_devs_enabled) {
-		// Mark original device params and remove-disabled
-		fprintf(fcfg, ",\n\"device\" : [");
-		bool first = true;
-		for (i = 0; i < MAX_DEVICES; i++) {
-			if (devices_enabled[i]) {
-				fprintf(fcfg, "%s\n\t%d", first ? "" : ",", i);
-				first = false;
-			}
-		}
-		fprintf(fcfg, "\n]");
-		fprintf(fcfg, ",\n\"remove-disabled\" : true");
-	}
+	_write_config_string_elist(fcfg, "scan", scan_devices);
+	_write_config_string_elist(fcfg, "device", opt_devices_enabled_list);
+	_write_config_string_elist(fcfg, "set-device", opt_set_device_list);
 	
 	if (opt_api_allow)
 		fprintf(fcfg, ",\n\"api-allow\" : \"%s\"", json_escape(opt_api_allow));
@@ -6353,6 +6552,10 @@ void write_config(FILE *fcfg)
 		fprintf(fcfg, ",\n\"icarus-options\" : \"%s\"", json_escape(opt_icarus_options));
 	if (opt_icarus_timing)
 		fprintf(fcfg, ",\n\"icarus-timing\" : \"%s\"", json_escape(opt_icarus_timing));
+#ifdef USE_KLONDIKE
+	if (opt_klondike_options)
+		fprintf(fcfg, ",\n\"klondike-options\" : \"%s\"", json_escape(opt_klondike_options));
+#endif
 	fputs("\n}\n", fcfg);
 
 	json_escape_free();
@@ -6665,6 +6868,11 @@ retry:
 		goto updated;
         } else if (!strncasecmp(&input, "p", 1)) {
 			char *prilist = curses_input("Enter new pool priority (comma separated list)");
+			if (!prilist)
+			{
+				wlogprint("Not changing priorities\n");
+				goto retry;
+			}
 			int res = prioritize_pools(prilist, &i);
 			free(prilist);
 			switch (res) {
@@ -6889,7 +7097,7 @@ retry:
 		default_save_file(filename);
 		snprintf(prompt, sizeof(prompt), "Config filename to write (Enter for default) [%s]", filename);
 		str = curses_input(prompt);
-		if (strcmp(str, "-1")) {
+		if (str) {
 			struct stat statbuf;
 
 			strcpy(filename, str);
@@ -6901,8 +7109,6 @@ retry:
 					goto retry;
 			}
 		}
-		else
-			free(str);
 		fcfg = fopen(filename, "w");
 		if (!fcfg) {
 			wlogprint("Cannot open or create file\n");
@@ -7077,7 +7283,7 @@ refresh:
 			{
 				static char *pattern = NULL;
 				char *newpattern = curses_input("Enter pattern");
-				if (strcmp(newpattern, "-1"))
+				if (newpattern)
 				{
 					free(pattern);
 					pattern = newpattern;
@@ -7160,7 +7366,17 @@ void show_help(void)
 		"ST: work in queue              | F: network fails  | NB: new blocks detected\n"
 		"AS: shares being submitted     | BW: bandwidth (up/down)\n"
 		"E: # shares * diff per 2kB bw  | U: shares/minute  | BS: best share ever found\n"
-		"\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc1\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc1\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\xc4\n"
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_BTEE
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		U8_HLINE U8_HLINE U8_HLINE U8_BTEE  U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE U8_HLINE
+		"\n"
 		"devices/processors hashing (only for totals line), hottest temperature\n"
 	);
 	wlogprint(
@@ -7349,7 +7565,7 @@ static void hashmeter(int thr_id, struct timeval *diff,
 
 	local_secs = (double)total_diff.tv_sec + ((double)total_diff.tv_usec / 1000000.0);
 	decay_time(&total_rolling, local_mhashes_done / local_secs, local_secs);
-	global_hashrate = roundl(total_rolling) * 1000000;
+	global_hashrate = ((unsigned long long)lround(total_rolling)) * 1000000;
 
 	timersub(&total_tv_end, &total_tv_start, &total_diff);
 	total_secs = (double)total_diff.tv_sec +
@@ -7402,9 +7618,9 @@ static void hashmeter(int thr_id, struct timeval *diff,
 		}
 		
 		if (working_devs == working_procs)
-			snprintf(statusline, sizeof(statusline), "%s%d        ", bad ? "\2" : "", working_devs);
+			snprintf(statusline, sizeof(statusline), "%s%d        ", bad ? U8_BAD_START : "", working_devs);
 		else
-			snprintf(statusline, sizeof(statusline), "%s%d/%d     ", bad ? "\2" : "", working_devs, working_procs);
+			snprintf(statusline, sizeof(statusline), "%s%d/%d     ", bad ? U8_BAD_START : "", working_devs, working_procs);
 		
 		divx = 7;
 		if (opt_show_procs && !opt_compact)
@@ -7412,9 +7628,9 @@ static void hashmeter(int thr_id, struct timeval *diff,
 		
 		if (bad)
 		{
-			++divx;
-			statusline[divx] = '\1';
-			++divx;
+			divx += sizeof(U8_BAD_START)-1;
+			strcpy(&statusline[divx], U8_BAD_END);
+			divx += sizeof(U8_BAD_END)-1;
 		}
 		
 		temperature_column(&statusline[divx], sizeof(statusline)-divx, true, &temp);
@@ -7529,9 +7745,16 @@ bool parse_stratum_response(struct pool *pool, char *s)
 
 	if (!json_is_integer(id_val)) {
 		if (json_is_string(id_val)
-		 && !strncmp(json_string_value(id_val), "txlist", 6)
-		 && !strcmp(json_string_value(id_val) + 6, pool->swork.job_id)
-		 && json_is_array(res_val)) {
+		 && !strncmp(json_string_value(id_val), "txlist", 6))
+		{
+			const bool is_array = json_is_array(res_val);
+			applog(LOG_DEBUG, "Received %s for pool %u job %s",
+			       is_array ? "transaction list" : "no-transaction-list response",
+			       pool->pool_no, &json_string_value(id_val)[6]);
+			if (strcmp(json_string_value(id_val) + 6, pool->swork.job_id) || !is_array)
+				// We only care about a transaction list for the current job id
+				goto fishy;
+			
 			// Check that the transactions actually hash to the merkle links
 			{
 				unsigned maxtx = 1 << pool->swork.merkles;
@@ -8091,7 +8314,7 @@ retry_stratum:
 
 			applog(LOG_DEBUG, "Pushing pooltest work to base pool");
 
-			tq_push(control_thr[stage_thr_id].q, work);
+			stage_work(work);
 			total_getworks++;
 			pool->getwork_requested++;
 			ret = true;
@@ -8200,9 +8423,11 @@ retry:
 			no_work = true;
 		}
 		ts = (struct timespec){ .tv_sec = opt_log_interval, };
+		pthread_cond_signal(&gws_cond);
 		if (ETIMEDOUT == pthread_cond_timedwait(&getq->cond, stgd_lock, &ts))
 		{
 			run_cmd(cmd_idle);
+			pthread_cond_signal(&gws_cond);
 			pthread_cond_wait(&getq->cond, stgd_lock);
 		}
 	}
@@ -8441,6 +8666,8 @@ void gen_stratum_work2(struct work *work, struct stratum_work *swork, const char
 	work->id = total_work++;
 	work->longpoll = false;
 	work->getwork_mode = GETWORK_MODE_STRATUM;
+	/* Nominally allow a driver to ntime roll 60 seconds */
+	work->drv_rolllimit = 60;
 	calc_diff(work, 0);
 }
 
@@ -8484,7 +8711,8 @@ struct work *get_work(struct thr_info *thr)
 			wake_gws();
 		}
 	}
-	applog(LOG_DEBUG, "%"PRIpreprv": Got work from get queue to get work for thread %d", cgpu->proc_repr, thr_id);
+	applog(LOG_DEBUG, "%"PRIpreprv": Got work %d from get queue to get work for thread %d",
+	       cgpu->proc_repr, work->id, thr_id);
 
 	work->thr_id = thr_id;
 	thread_reportin(thr);
@@ -8534,10 +8762,9 @@ void _submit_work_async(struct work *work)
 	notifier_wake(submit_waiting_notifier);
 }
 
-static void submit_work_async(struct work *work_in, struct timeval *tv_work_found)
+/* Submit a copy of the tested, statistic recorded work item asynchronously */
+static void submit_work_async2(struct work *work, struct timeval *tv_work_found)
 {
-	struct work *work = copy_work(work_in);
-
 	if (tv_work_found)
 		copy_time(&work->tv_work_found, tv_work_found);
 	
@@ -8549,8 +8776,14 @@ void inc_hw_errors2(struct thr_info *thr, const struct work *work, const uint32_
 	struct cgpu_info * const cgpu = thr->cgpu;
 	
 	if (bad_nonce_p)
-		applog(LOG_DEBUG, "%"PRIpreprv": invalid nonce (%08lx) - HW error",
-		       cgpu->proc_repr, (unsigned long)be32toh(*bad_nonce_p));
+	{
+		if (bad_nonce_p == UNKNOWN_NONCE)
+			applog(LOG_DEBUG, "%"PRIpreprv": invalid nonce - HW error",
+			       cgpu->proc_repr);
+		else
+			applog(LOG_DEBUG, "%"PRIpreprv": invalid nonce (%08lx) - HW error",
+			       cgpu->proc_repr, (unsigned long)be32toh(*bad_nonce_p));
+	}
 	
 	mutex_lock(&stats_lock);
 	hw_errors++;
@@ -8606,8 +8839,20 @@ enum test_nonce2_result _test_nonce2(struct work *work, uint32_t nonce, bool che
 /* Returns true if nonce for work was a valid share */
 bool submit_nonce(struct thr_info *thr, struct work *work, uint32_t nonce)
 {
+	return submit_noffset_nonce(thr, work, nonce, 0);
+}
+
+/* Allows drivers to submit work items where the driver has changed the ntime
+ * value by noffset. Must be only used with a work protocol that does not ntime
+ * roll itself intrinsically to generate work (eg stratum). We do not touch
+ * the original work struct, but the copy of it only. */
+bool submit_noffset_nonce(struct thr_info *thr, struct work *work_in, uint32_t nonce,
+			  int noffset)
+{
+	struct work *work = make_work();
+	_copy_work(work, work_in, noffset);
+	
 	uint32_t *work_nonce = (uint32_t *)(work->data + 64 + 12);
-	uint32_t bak_nonce = *work_nonce;
 	struct timeval tv_work_found;
 	enum test_nonce2_result res;
 	bool ret = true;
@@ -8648,9 +8893,11 @@ bool submit_nonce(struct thr_info *thr, struct work *work, uint32_t nonce)
 			goto out;
 	}
 	
-	submit_work_async(work, &tv_work_found);
+	submit_work_async2(work, &tv_work_found);
+	work = NULL;  // Taken by submit_work_async2
 out:
-	*work_nonce = bak_nonce;
+	if (work)
+		free_work(work);
 	thread_reportin(thr);
 
 	return ret;
@@ -8697,29 +8944,35 @@ void mt_disable_start(struct thr_info *mythr)
 	mythr->_mt_disable_called = true;
 }
 
-/* Create a hashtable of work items for devices with a queue. The device
- * driver must have a custom queue_full function or it will default to true
- * and put only one work item in the queue. Work items should not be removed
- * from this hashtable until they are no longer in use anywhere. Once a work
- * item is physically queued on the device itself, the work->queued flag
- * should be set under cgpu->qlock write lock to prevent it being dereferenced
- * while still in use. */
+/* Put a new unqueued work item in cgpu->unqueued_work under cgpu->qlock till
+ * the driver tells us it's full so that it may extract the work item using
+ * the get_queued() function which adds it to the hashtable on
+ * cgpu->queued_work. */
 static void fill_queue(struct thr_info *mythr, struct cgpu_info *cgpu, struct device_drv *drv, const int thr_id)
 {
 	thread_reportout(mythr);
 	do {
 		bool need_work;
 
-		rd_lock(&cgpu->qlock);
-		need_work = (HASH_COUNT(cgpu->queued_work) == cgpu->queued_count);
-		rd_unlock(&cgpu->qlock);
+		/* Do this lockless just to know if we need more unqueued work. */
+		need_work = (!cgpu->unqueued_work);
 
+		/* get_work is a blocking function so do it outside of lock
+		 * to prevent deadlocks with other locks. */
 		if (need_work) {
 			struct work *work = get_work(mythr);
 
 			wr_lock(&cgpu->qlock);
-			HASH_ADD_INT(cgpu->queued_work, id, work);
+			/* Check we haven't grabbed work somehow between
+			 * checking and picking up the lock. */
+			if (likely(!cgpu->unqueued_work))
+				cgpu->unqueued_work = work;
+			else
+				need_work = false;
 			wr_unlock(&cgpu->qlock);
+
+			if (unlikely(!need_work))
+				discard_work(work);
 		}
 		/* The queue_full function should be used by the driver to
 		 * actually place work items on the physical device if it
@@ -8727,26 +8980,45 @@ static void fill_queue(struct thr_info *mythr, struct cgpu_info *cgpu, struct de
 	} while (drv->queue_full && !drv->queue_full(cgpu));
 }
 
-/* This function is for retrieving one work item from the queued hashtable of
- * available work items that are not yet physically on a device (which is
- * flagged with the work->queued bool). Code using this function must be able
- * to handle NULL as a return which implies there is no work available. */
+/* Add a work item to a cgpu's queued hashlist */
+void __add_queued(struct cgpu_info *cgpu, struct work *work)
+{
+	cgpu->queued_count++;
+	HASH_ADD_INT(cgpu->queued_work, id, work);
+}
+
+/* This function is for retrieving one work item from the unqueued pointer and
+ * adding it to the hashtable of queued work. Code using this function must be
+ * able to handle NULL as a return which implies there is no work available. */
 struct work *get_queued(struct cgpu_info *cgpu)
 {
-	struct work *work, *tmp, *ret = NULL;
+	struct work *work = NULL;
 
 	wr_lock(&cgpu->qlock);
-	HASH_ITER(hh, cgpu->queued_work, work, tmp) {
-		if (!work->queued) {
-			work->queued = true;
-			cgpu->queued_count++;
-			ret = work;
-			break;
-		}
+	if (cgpu->unqueued_work) {
+		work = cgpu->unqueued_work;
+		__add_queued(cgpu, work);
+		cgpu->unqueued_work = NULL;
 	}
 	wr_unlock(&cgpu->qlock);
 
-	return ret;
+	return work;
+}
+
+void add_queued(struct cgpu_info *cgpu, struct work *work)
+{
+	wr_lock(&cgpu->qlock);
+	__add_queued(cgpu, work);
+	wr_unlock(&cgpu->qlock);
+}
+
+/* Get fresh work and add it to cgpu's queued hashlist */
+struct work *get_queue_work(struct thr_info *thr, struct cgpu_info *cgpu, int thr_id)
+{
+	struct work *work = get_work(thr);
+
+	add_queued(cgpu, work);
+	return work;
 }
 
 /* This function is for finding an already queued work item in the
@@ -8759,8 +9031,7 @@ struct work *__find_work_bymidstate(struct work *que, char *midstate, size_t mid
 	struct work *work, *tmp, *ret = NULL;
 
 	HASH_ITER(hh, que, work, tmp) {
-		if (work->queued &&
-		    memcmp(work->midstate, midstate, midstatelen) == 0 &&
+		if (memcmp(work->midstate, midstate, midstatelen) == 0 &&
 		    memcmp(work->data + offset, data, datalen) == 0) {
 			ret = work;
 			break;
@@ -8798,10 +9069,9 @@ struct work *clone_queued_work_bymidstate(struct cgpu_info *cgpu, char *midstate
 	return ret;
 }
 
-static void __work_completed(struct cgpu_info *cgpu, struct work *work)
+void __work_completed(struct cgpu_info *cgpu, struct work *work)
 {
-	if (work->queued)
-		cgpu->queued_count--;
+	cgpu->queued_count--;
 	HASH_DEL(cgpu->queued_work, work);
 }
 /* This function should be used by queued device drivers when they're sure
@@ -8832,23 +9102,17 @@ struct work *take_queued_work_bymidstate(struct cgpu_info *cgpu, char *midstate,
 
 static void flush_queue(struct cgpu_info *cgpu)
 {
-	struct work *work, *tmp;
-	int discarded = 0;
+	struct work *work = NULL;
 
 	wr_lock(&cgpu->qlock);
-	HASH_ITER(hh, cgpu->queued_work, work, tmp) {
-		/* Can only discard the work items if they're not physically
-		 * queued on the device. */
-		if (!work->queued) {
-			HASH_DEL(cgpu->queued_work, work);
-			discard_work(work);
-			discarded++;
-		}
-	}
+	work = cgpu->unqueued_work;
+	cgpu->unqueued_work = NULL;
 	wr_unlock(&cgpu->qlock);
 
-	if (discarded)
-		applog(LOG_DEBUG, "Discarded %d queued work items", discarded);
+	if (work) {
+		free_work(work);
+		applog(LOG_DEBUG, "Discarded queued work item");
+	}
 }
 
 /* This version of hash work is for devices that are fast enough to always
@@ -8871,12 +9135,15 @@ void hash_queued_work(struct thr_info *mythr)
 		struct timeval diff;
 		int64_t hashes;
 
-		mythr->work_restart = false;
-
 		fill_queue(mythr, cgpu, drv, thr_id);
 
 		thread_reportin(mythr);
 		hashes = drv->scanwork(mythr);
+
+		/* Reset the bool here in case the driver looks for it
+		 * synchronously in the scanwork loop. */
+		mythr->work_restart = false;
+
 		if (unlikely(hashes == -1 )) {
 			applog(LOG_ERR, "%s %d failure, disabling!", drv->name, cgpu->device_id);
 			cgpu->deven = DEV_DISABLED;
@@ -9709,6 +9976,7 @@ void print_summary(void)
 			efficiency = pool_bytes_xfer ? pool->diff_accepted * 2048. / pool_bytes_xfer : 0.0;
 			applog(LOG_WARNING, " Efficiency (accepted * difficulty / 2 KB): %.2f", efficiency);
 
+			applog(LOG_WARNING, " Items worked on: %d", pool->works);
 			applog(LOG_WARNING, " Unable to get work from server occasions: %d", pool->getfail_occasions);
 			applog(LOG_WARNING, " Submitting work remotely delay occasions: %d\n", pool->remotefail_occasions);
 		}
@@ -9729,9 +9997,9 @@ void print_summary(void)
 	}
 
 	if (opt_shares) {
-		applog(LOG_WARNING, "Mined %d accepted shares of %d requested\n", total_accepted, opt_shares);
-		if (opt_shares > total_accepted)
-			applog(LOG_WARNING, "WARNING - Mined only %d shares of %d requested.", total_accepted, opt_shares);
+		applog(LOG_WARNING, "Mined %.0f accepted shares of %d requested\n", total_diff_accepted, opt_shares);
+		if (opt_shares > total_diff_accepted)
+			applog(LOG_WARNING, "WARNING - Mined only %.0f shares of %d requested.", total_diff_accepted, opt_shares);
 	}
 	applog(LOG_WARNING, " ");
 
@@ -9739,7 +10007,7 @@ void print_summary(void)
 	fflush(stdout);
 }
 
-void _bfg_clean_up(void)
+void _bfg_clean_up(bool restarting)
 {
 #ifdef HAVE_OPENCL
 	clear_adl(nDevs);
@@ -9753,16 +10021,24 @@ void _bfg_clean_up(void)
 #ifdef WIN32
 	timeEndPeriod(1);
 #endif
+	if (!restarting) {
+		/* Attempting to disable curses or print a summary during a
+		 * restart can lead to a deadlock. */
 #ifdef HAVE_CURSES
-	disable_curses();
+		disable_curses();
 #endif
-	if (!opt_realquiet && successful_connect)
-		print_summary();
+		if (!opt_realquiet && successful_connect)
+			print_summary();
+	}
 
 	if (opt_n_threads)
 		free(cpus);
 
 	curl_global_cleanup();
+	
+#ifdef WIN32
+	WSACleanup();
+#endif
 }
 
 void _quit(int status)
@@ -9799,7 +10075,10 @@ char *curses_input(const char *query)
 	wlogprint("%s:\n", query);
 	wgetnstr(logwin, input, 255);
 	if (!strlen(input))
-		strcpy(input, "-1");
+	{
+		free(input);
+		input = NULL;
+	}
 	leaveok(logwin, true);
 	noecho();
 	return input;
@@ -9887,7 +10166,7 @@ static bool input_pool(bool live)
 
 	pass = curses_input("Password");
 	if (!pass)
-		goto out;
+		pass = calloc(1, 1);
 
 	pool = add_pool();
 
@@ -10115,6 +10394,7 @@ extern struct sigaction pcwm_orig_term_handler;
 #endif
 
 bool bfg_need_detect_rescan;
+extern void probe_device(struct lowlevel_device_info *);
 
 static
 void drv_detect_all()
@@ -10123,7 +10403,12 @@ rescan:
 	bfg_need_detect_rescan = false;
 	
 #ifdef HAVE_BFG_LOWLEVEL
-	lowlevel_scan();
+	struct lowlevel_device_info * const infolist = lowlevel_scan(), *info, *infotmp;
+	
+	LL_FOREACH_SAFE(infolist, info, infotmp)
+		probe_device(info);
+	LL_FOREACH_SAFE(infolist, info, infotmp)
+		pthread_join(info->probe_pth, NULL);
 #endif
 	
 	struct driver_registration *reg, *tmp;
@@ -10167,6 +10452,21 @@ void allocate_cgpu(struct cgpu_info *cgpu, unsigned int *kp)
 	cgpu->thr = calloc(threadobj + 1, sizeof(*cgpu->thr));
 	cgpu->thr[threadobj] = NULL;
 	cgpu->status = LIFE_INIT;
+	
+	if (opt_devices_enabled_list)
+	{
+		struct string_elist *enablestr_elist;
+		cgpu->deven = DEV_DISABLED;
+		DL_FOREACH(opt_devices_enabled_list, enablestr_elist)
+		{
+			const char * const enablestr = enablestr_elist->string;
+			if (cgpu_match(enablestr, cgpu))
+			{
+				cgpu->deven = DEV_ENABLED;
+				break;
+			}
+		}
+	}
 
 	cgpu->max_hashes = 0;
 
@@ -10255,6 +10555,181 @@ void _scan_serial(void *p)
 		scan_devices = orig_scan_devices;
 	}
 }
+
+#ifdef HAVE_BFG_LOWLEVEL
+static
+bool _probe_device_match(const struct lowlevel_device_info * const info, const char * const ser)
+{
+	if (!(false
+		|| (info->serial && !strcasecmp(ser, info->serial))
+		|| (info->path   && !strcasecmp(ser, info->path  ))
+	))
+	{
+		char *devid = devpath_to_devid(ser);
+		if (!devid)
+			return false;
+		const bool different = strcmp(info->devid, devid);
+		free(devid);
+		if (different)
+			return false;
+	}
+	return true;
+}
+
+static
+const struct device_drv *_probe_device_find_drv(const char * const _dname, const size_t dnamelen)
+{
+	struct driver_registration *dreg;
+	char dname[dnamelen];
+	int i;
+	
+	for (i = 0; i < dnamelen; ++i)
+		dname[i] = tolower(_dname[i]);
+	BFG_FIND_DRV_BY_DNAME(dreg, dname, dnamelen);
+	if (!dreg)
+	{
+		for (i = 0; i < dnamelen; ++i)
+			dname[i] = toupper(_dname[i]);
+		BFG_FIND_DRV_BY_NAME(dreg, dname, dnamelen);
+		if (!dreg)
+			return NULL;
+	}
+	
+	return dreg->drv;
+}
+
+static
+bool _probe_device_internal(struct lowlevel_device_info * const info, const char * const dname, const size_t dnamelen)
+{
+	const struct device_drv * const drv = _probe_device_find_drv(dname, dnamelen);
+	if (!(drv && drv->lowl_probe))
+		return false;
+	return drv->lowl_probe(info);
+}
+
+static
+void *probe_device_thread(void *p)
+{
+	struct lowlevel_device_info * const infolist = p;
+	struct lowlevel_device_info *info = infolist;
+	
+	{
+		char threadname[5 + strlen(info->devid) + 1];
+		sprintf(threadname, "probe_%s", info->devid);
+		RenameThread(threadname);
+	}
+	
+	// If already in use, ignore
+	if (bfg_claim_any(NULL, NULL, info->devid))
+		applogr(NULL, LOG_DEBUG, "%s: \"%s\" already in use",
+		        __func__, info->product);
+	
+	// if lowlevel device matches specific user assignment, probe requested driver(s)
+	struct string_elist *sd_iter, *sd_tmp;
+	struct driver_registration *dreg, *dreg_tmp;
+	DL_FOREACH_SAFE(scan_devices, sd_iter, sd_tmp)
+	{
+		const char * const dname = sd_iter->string;
+		const char * const colon = strpbrk(dname, ":@");
+		if (!(colon && colon != dname))
+			continue;
+		const char * const ser = &colon[1];
+		LL_FOREACH2(infolist, info, same_devid_next)
+		{
+			if (!_probe_device_match(info, ser))
+				continue;
+			const size_t dnamelen = (colon - dname);
+			if (_probe_device_internal(info, dname, dnamelen))
+				return NULL;
+		}
+	}
+	
+	// probe driver(s) with auto enabled and matching VID/PID/Product/etc of device
+	BFG_FOREACH_DRIVER_BY_PRIORITY(dreg, dreg_tmp)
+	{
+		const struct device_drv * const drv = dreg->drv;
+		
+		// Check for "noauto" flag
+		// NOTE: driver-specific configuration overrides general
+		bool doauto = true;
+		DL_FOREACH_SAFE(scan_devices, sd_iter, sd_tmp)
+		{
+			const char * const dname = sd_iter->string;
+			// NOTE: Only checking flags here, NOT path/serial, so @ is unacceptable
+			const char *colon = strchr(dname, ':');
+			if (!colon)
+				colon = &dname[-1];
+			if (strcasecmp("noauto", &colon[1]) && strcasecmp("auto", &colon[1]))
+				continue;
+			const ssize_t dnamelen = (colon - dname);
+			if (dnamelen >= 0 && _probe_device_find_drv(dname, dnamelen) != drv)
+				continue;
+			doauto = (tolower(colon[1]) == 'a');
+			if (dnamelen != -1)
+				break;
+		}
+		
+		if (doauto && drv->lowl_match)
+		{
+			LL_FOREACH2(infolist, info, same_devid_next)
+			{
+				if (!drv->lowl_match(info))
+					continue;
+				if (drv->lowl_probe(info))
+					return NULL;
+			}
+		}
+	}
+	
+	// probe driver(s) with 'all' enabled
+	DL_FOREACH_SAFE(scan_devices, sd_iter, sd_tmp)
+	{
+		const char * const dname = sd_iter->string;
+		// NOTE: Only checking flags here, NOT path/serial, so @ is unacceptable
+		const char * const colon = strchr(dname, ':');
+		if (!colon)
+		{
+			LL_FOREACH2(infolist, info, same_devid_next)
+			{
+				if (
+#ifdef NEED_BFG_LOWL_VCOM
+					(info->lowl == &lowl_vcom && !strcasecmp(dname, "all")) ||
+#endif
+					_probe_device_match(info, (dname[0] == '@') ? &dname[1] : dname))
+				{
+					BFG_FOREACH_DRIVER_BY_PRIORITY(dreg, dreg_tmp)
+					{
+						const struct device_drv * const drv = dreg->drv;
+						if (drv->lowl_probe_by_name_only)
+							continue;
+						if (!drv->lowl_probe)
+							continue;
+						if (drv->lowl_probe(info))
+							return NULL;
+					}
+					break;
+				}
+			}
+			continue;
+		}
+		if (strcasecmp(&colon[1], "all"))
+			continue;
+		const size_t dnamelen = (colon - dname);
+		LL_FOREACH2(infolist, info, same_devid_next)
+		{
+			if (_probe_device_internal(info, dname, dnamelen))
+				return NULL;
+		}
+	}
+	
+	return NULL;
+}
+
+void probe_device(struct lowlevel_device_info * const info)
+{
+	pthread_create(&info->probe_pth, NULL, probe_device_thread, info);
+}
+#endif
 
 int create_new_cgpus(void (*addfunc)(void*), void *arg)
 {
@@ -10415,6 +10890,15 @@ int main(int argc, char *argv[])
 	setup_pthread_cancel_workaround();
 #endif
 
+#ifdef WIN32
+	{
+		WSADATA wsa;
+		i = WSAStartup(MAKEWORD(2, 2), &wsa);
+		if (i)
+			quit(1, "Failed to initialise Winsock: %s", bfg_strerror(i, BST_SOCKET));
+	}
+#endif
+	
 	/* This dangerous functions tramples random dynamically allocated
 	 * variables so do it before anything at all */
 	if (unlikely(curl_global_init(CURL_GLOBAL_ALL)))
@@ -10578,8 +11062,10 @@ int main(int argc, char *argv[])
 	}
 	
 	if (opt_unittest) {
+		test_cgpu_match();
 		test_intrange();
 		test_decimal_width();
+		utf8_test();
 	}
 
 #ifdef HAVE_CURSES
@@ -10680,57 +11166,45 @@ int main(int argc, char *argv[])
 	devices_new = NULL;
 
 	if (opt_display_devs) {
+		int devcount = 0;
 		applog(LOG_ERR, "Devices detected:");
 		for (i = 0; i < total_devices; ++i) {
 			struct cgpu_info *cgpu = devices[i];
+			char buf[0x100];
+			if (cgpu->device != cgpu)
+				continue;
 			if (cgpu->name)
-				applog(LOG_ERR, " %2d. %"PRIprepr": %s (driver: %s)", i, cgpu->proc_repr, cgpu->name, cgpu->drv->dname);
+				snprintf(buf, sizeof(buf), " %s", cgpu->name);
 			else
-				applog(LOG_ERR, " %2d. %"PRIprepr" (driver: %s)", i, cgpu->proc_repr, cgpu->drv->dname);
+			if (cgpu->dev_manufacturer)
+				snprintf(buf, sizeof(buf), " %s by %s", (cgpu->dev_product ?: "Device"), cgpu->dev_manufacturer);
+			else
+			if (cgpu->dev_product)
+				snprintf(buf, sizeof(buf), " %s", cgpu->dev_product);
+			else
+				strcpy(buf, " Device");
+			tailsprintf(buf, sizeof(buf), " (driver=%s; procs=%d", cgpu->drv->dname, cgpu->procs);
+			if (cgpu->dev_serial)
+				tailsprintf(buf, sizeof(buf), "; serial=%s", cgpu->dev_serial);
+			if (cgpu->device_path)
+				tailsprintf(buf, sizeof(buf), "; path=%s", cgpu->device_path);
+			tailsprintf(buf, sizeof(buf), ")");
+			_applog(LOG_NOTICE, buf);
+			++devcount;
 		}
-		quit(0, "%d devices listed", total_devices);
+		quit(0, "%d devices listed", devcount);
 	}
 
 	mining_threads = 0;
-	if (opt_devs_enabled) {
-		for (i = 0; i < MAX_DEVICES; i++) {
-			if (devices_enabled[i]) {
-				if (i >= total_devices)
-					quit (1, "Command line options set a device that doesn't exist");
-				register_device(devices[i]);
-			} else if (i < total_devices) {
-				if (opt_removedisabled) {
-					if (devices[i]->drv == &cpu_drv)
-						--opt_n_threads;
-				} else {
-					register_device(devices[i]);
-				}
-				devices[i]->deven = DEV_DISABLED;
-			}
-		}
-		total_devices = cgminer_id_count;
-	} else {
-		for (i = 0; i < total_devices; ++i)
-			register_device(devices[i]);
-	}
+	for (i = 0; i < total_devices; ++i)
+		register_device(devices[i]);
 
 	if (!total_devices) {
-		const bool netdev_support =
-#ifdef USE_LIBMICROHTTPD
-			(httpsrv_port != -1) ||
-#endif
-#ifdef USE_LIBEVENT
-			(stratumsrv_port != -1) ||
-#endif
-			false;
-		if ((!netdev_support) && (!use_curses) && !opt_api_listen)
-			quit(1, "All devices disabled, cannot mine!");
 		applog(LOG_WARNING, "No devices detected!");
 		if (use_curses)
 			applog(LOG_WARNING, "Waiting for devices; press 'M+' to add, or 'Q' to quit");
 		else
-			applog(LOG_WARNING, "Waiting for %s or press Ctrl-C to quit",
-		       netdev_support ? "network devices" : "RPC commands");
+			applog(LOG_WARNING, "Waiting for devices");
 	}
 
 	load_temp_config();
@@ -10795,22 +11269,12 @@ int main(int argc, char *argv[])
 			quit(1, "Failed to calloc mining_thr[%d]", i);
 	}
 
-	total_control_threads = 7;
+	total_control_threads = 6;
 	control_thr = calloc(total_control_threads, sizeof(*thr));
 	if (!control_thr)
 		quit(1, "Failed to calloc control_thr");
 
 	gwsched_thr_id = 0;
-	stage_thr_id = 1;
-	thr = &control_thr[stage_thr_id];
-	thr->q = tq_new();
-	if (!thr->q)
-		quit(1, "Failed to tq_new");
-	/* start stage thread */
-	if (thr_info_create(thr, NULL, stage_thread, thr))
-		quit(1, "stage thread create failed");
-	pthread_detach(thr->pth);
-
 	/* Create a unique get work queue */
 	getq = tq_new();
 	if (!getq)
@@ -10929,14 +11393,14 @@ begin_bench:
 			quit(1, "submit_work thread create failed");
 	}
 
-	watchpool_thr_id = 2;
+	watchpool_thr_id = 1;
 	thr = &control_thr[watchpool_thr_id];
 	/* start watchpool thread */
 	if (thr_info_create(thr, NULL, watchpool_thread, NULL))
 		quit(1, "watchpool thread create failed");
 	pthread_detach(thr->pth);
 
-	watchdog_thr_id = 3;
+	watchdog_thr_id = 2;
 	thr = &control_thr[watchdog_thr_id];
 	/* start watchdog thread */
 	if (thr_info_create(thr, NULL, watchdog_thread, NULL))
@@ -10945,7 +11409,7 @@ begin_bench:
 
 #ifdef HAVE_OPENCL
 	/* Create reinit gpu thread */
-	gpur_thr_id = 4;
+	gpur_thr_id = 3;
 	thr = &control_thr[gpur_thr_id];
 	thr->q = tq_new();
 	if (!thr->q)
@@ -10955,7 +11419,7 @@ begin_bench:
 #endif	
 
 	/* Create API socket thread */
-	api_thr_id = 5;
+	api_thr_id = 4;
 	thr = &control_thr[api_thr_id];
 	if (thr_info_create(thr, NULL, api_thread, thr))
 		quit(1, "API thread create failed");
@@ -10974,7 +11438,7 @@ begin_bench:
 	/* Create curses input thread for keyboard input. Create this last so
 	 * that we know all threads are created since this can call kill_work
 	 * to try and shut down ll previous threads. */
-	input_thr_id = 6;
+	input_thr_id = 5;
 	thr = &control_thr[input_thr_id];
 	if (thr_info_create(thr, NULL, input_thread, thr))
 		quit(1, "input thread create failed");
@@ -10982,7 +11446,7 @@ begin_bench:
 #endif
 
 	/* Just to be sure */
-	if (total_control_threads != 7)
+	if (total_control_threads != 6)
 		quit(1, "incorrect total_control_threads (%d) should be 7", total_control_threads);
 
 	/* Once everything is set up, main() becomes the getwork scheduler */

@@ -11,10 +11,6 @@
 
 #include "config.h"
 
-#ifdef WIN32
-#include <winsock2.h>
-#endif
-
 #ifdef HAVE_CURSES
 // Must be before stdbool, since pdcurses typedefs bool :/
 #include <curses.h>
@@ -818,7 +814,7 @@ void pause_dynamic_threads(int gpu)
 	for (i = 1; i < cgpu->threads; i++) {
 		struct thr_info *thr;
 
-		thr = get_thread(i);
+		thr = cgpu->thr[i];
 		if (!thr->pause && cgpu->dynamic) {
 			applog(LOG_WARNING, "Disabling extra threads due to dynamic mode.");
 			applog(LOG_WARNING, "Tune dynamic intensity with --gpu-dyninterval");
@@ -1424,11 +1420,7 @@ static int opencl_autodetect()
 
 static void opencl_detect()
 {
-	if (total_devices || total_devices_new)
-		// If there are any other devices, only act if the user has explicitly enabled OpenCL
-		noserial_detect_manual(&opencl_api, opencl_autodetect);
-	else
-		noserial_detect(&opencl_api, opencl_autodetect);
+	noserial_detect_manual(&opencl_api, opencl_autodetect);
 }
 
 static void reinit_opencl_device(struct cgpu_info *gpu)

@@ -16,9 +16,10 @@
 
 #include "deviceapi.h"
 #include "driver-bitfury.h"
-#include "fpgautils.h"
 #include "libbitfury.h"
 #include "logging.h"
+#include "lowlevel.h"
+#include "lowl-vcom.h"
 #include "miner.h"
 #include "spidevc.h"
 #include "util.h"
@@ -89,7 +90,7 @@ uint16_t crc16(void *p, size_t sz)
 }
 
 static
-ssize_t keep_reading(int fd, void *buf, size_t count)
+ssize_t keep_reading(int prio, int fd, void *buf, size_t count)
 {
 	ssize_t r, rv = 0;
 	
@@ -98,7 +99,7 @@ ssize_t keep_reading(int fd, void *buf, size_t count)
 		r = read(fd, buf, count);
 		if (unlikely(r <= 0))
 		{
-			applog(LOG_ERR, "Read of fd %d returned %d", fd, (int)r);
+			applog(prio, "Read of fd %d returned %d", fd, (int)r);
 			return rv ?: r;
 		}
 		rv += r;
@@ -145,7 +146,7 @@ bool bitfury_do_packet(int prio, const char *repr, const int fd, void * const bu
 	}
 	
 	{
-		r = keep_reading(fd, pkt, 5);
+		r = keep_reading(prio, fd, pkt, 5);
 		if (5 != r || pkt[0] != 0xab || pkt[1] != 0xcd || pkt[2] != op)
 		{
 			char hex[(r * 2) + 1];
@@ -155,7 +156,7 @@ bool bitfury_do_packet(int prio, const char *repr, const int fd, void * const bu
 			return false;
 		}
 		sz = (((unsigned)pkt[3] << 8) | pkt[4]) + 2;
-		r = keep_reading(fd, &pkt[5], sz);
+		r = keep_reading(prio, fd, &pkt[5], sz);
 		if (sz != r)
 		{
 			r += 5;
@@ -220,6 +221,12 @@ bool littlefury_txrx(struct spi_port *port)
 	}
 	
 	return true;
+}
+
+static
+bool littlefury_lowl_match(const struct lowlevel_device_info * const info)
+{
+	return lowlevel_match_product(info, "LittleFury");
 }
 
 static
@@ -304,19 +311,15 @@ bool littlefury_detect_one(const char *devpath)
 	return add_cgpu(cgpu);
 
 err:
+	if (fd != -1)
+		serial_close(fd);
 	return false;
 }
 
 static
-int littlefury_detect_auto(void)
+bool littlefury_lowl_probe(const struct lowlevel_device_info * const info)
 {
-	return serial_autodetect(littlefury_detect_one, "LittleFury");
-}
-
-static
-void littlefury_detect(void)
-{
-	serial_detect_auto(&littlefury_drv, littlefury_detect_one, littlefury_detect_auto);
+	return vcom_lowl_probe_wrapper(info, littlefury_detect_one);
 }
 
 static
@@ -468,7 +471,8 @@ void littlefury_reinit(struct cgpu_info * const proc)
 struct device_drv littlefury_drv = {
 	.dname = "littlefury",
 	.name = "LFY",
-	.drv_detect = littlefury_detect,
+	.lowl_match = littlefury_lowl_match,
+	.lowl_probe = littlefury_lowl_probe,
 	
 	.thread_init = littlefury_thread_init,
 	.thread_disable = littlefury_disable,

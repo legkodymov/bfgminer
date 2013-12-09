@@ -12,14 +12,44 @@
 
 #include "config.h"
 
-#ifdef WIN32
-#include <winsock2.h>
-#endif
-
 #include <stdbool.h>
 
 #if !(defined(WIN32) || defined(unix))
 #define unix
+#endif
+
+#if defined(LL_FOREACH) && !defined(LL_FOREACH2)
+
+// Missing from uthash before 1.9.7
+
+#define LL_DELETE2(head,del,next)                                                              \
+do {                                                                                           \
+  LDECLTYPE(head) _tmp;                                                                        \
+  if ((head) == (del)) {                                                                       \
+    (head)=(head)->next;                                                                       \
+  } else {                                                                                     \
+    _tmp = head;                                                                               \
+    while (_tmp->next && (_tmp->next != (del))) {                                              \
+      _tmp = _tmp->next;                                                                       \
+    }                                                                                          \
+    if (_tmp->next) {                                                                          \
+      _tmp->next = ((del)->next);                                                              \
+    }                                                                                          \
+  }                                                                                            \
+} while (0)
+
+#define LL_FOREACH2(head,el,next)                                                              \
+    for(el=head;el;el=(el)->next)
+
+#define LL_FOREACH_SAFE2(head,el,tmp,next)                                                     \
+  for((el)=(head);(el) && (tmp = (el)->next, 1); (el) = tmp)
+
+#define LL_PREPEND2(head,add,next)                                                             \
+do {                                                                                           \
+  (add)->next = head;                                                                          \
+  head = add;                                                                                  \
+} while (0)
+
 #endif
 
 #ifdef WIN32
@@ -123,7 +153,7 @@ static inline int nanosleep(const struct timespec *req, struct timespec *rem)
 #undef cgtime
 #endif
 
-#ifdef WIN32
+#ifndef HAVE_SLEEP
 static inline int sleep(unsigned int secs)
 {
 	struct timespec req, rem;
@@ -133,7 +163,9 @@ static inline int sleep(unsigned int secs)
 		return 0;
 	return rem.tv_sec + (rem.tv_nsec ? 1 : 0);
 }
+#endif
 
+#ifdef WIN32
 enum {
 	PRIO_PROCESS		= 0,
 };

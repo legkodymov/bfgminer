@@ -32,10 +32,6 @@
 #include "config.h"
 #include "miner.h"
 
-#ifdef WIN32
-#include <winsock2.h>
-#endif
-
 #include <limits.h>
 #include <pthread.h>
 #include <stdbool.h>
@@ -64,7 +60,7 @@
 #include "compat.h"
 #include "dynclock.h"
 #include "icarus-common.h"
-#include "fpgautils.h"
+#include "lowl-vcom.h"
 
 // The serial I/O speed - Linux uses a define 'B115200' in bits/termios.h
 #define ICARUS_IO_SPEED 115200
@@ -675,9 +671,10 @@ static bool icarus_detect_one(const char *devpath)
 	return true;
 }
 
-static void icarus_detect()
+static
+bool icarus_lowl_probe(const struct lowlevel_device_info * const info)
 {
-	serial_detect(&icarus_drv, icarus_detect_one);
+	return vcom_lowl_probe_wrapper(info, icarus_detect_one);
 }
 
 static bool icarus_prepare(struct thr_info *thr)
@@ -1310,7 +1307,7 @@ struct device_drv icarus_drv = {
 	.dname = "icarus",
 	.name = "ICA",
 	.probe_priority = -120,
-	.drv_detect = icarus_detect,
+	.lowl_probe = icarus_lowl_probe,
 	.get_api_stats = icarus_drv_stats,
 	.thread_prepare = icarus_prepare,
 	.thread_init = icarus_init,

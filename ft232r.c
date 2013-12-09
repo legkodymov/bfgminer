@@ -9,10 +9,6 @@
 
 #include "config.h"
 
-#ifdef WIN32
-#include <winsock2.h>
-#endif
-
 #include <errno.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -21,7 +17,6 @@
 #include <libusb.h>
 
 #include "compat.h"
-#include "fpgautils.h"
 #include "ft232r.h"
 #include "logging.h"
 #include "lowlevel.h"

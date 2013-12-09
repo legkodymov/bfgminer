@@ -105,13 +105,8 @@ bfgminer_CPPFLAGS += $(libevent_CFLAGS)
 endif
 
 
-# GPU sources, TODO: make them selectable
-# the GPU portion extracted from original main.c
-bfgminer_SOURCES += driver-opencl.h driver-opencl.c
-
 if HAVE_OPENCL
-
-# the original GPU related sources, unchanged
+bfgminer_SOURCES += driver-opencl.h driver-opencl.c
 bfgminer_SOURCES += ocl.c ocl.h findnonce.c findnonce.h
 bfgminer_SOURCES += adl.c adl.h adl_functions.h
 bfgminer_SOURCES += *.cl
@@ -134,6 +129,7 @@ dist_doc_DATA += README.scrypt
 endif
 
 if HAS_CPUMINE
+dist_doc_DATA += README.CPU
 bfgminer_SOURCES	+= \
 		  sha256_generic.c sha256_via.c	\
 		  sha256_cryptopp.c sha256_sse2_amd64.c		\
@@ -172,8 +168,8 @@ endif # HAVE_x86_64
 endif # HAS_YASM
 endif # HAS_CPUMINE
 
-if NEED_FPGAUTILS
-bfgminer_SOURCES += fpgautils.c fpgautils.h
+if NEED_BFG_LOWL_VCOM
+bfgminer_SOURCES += lowl-vcom.c lowl-vcom.h
 if HAVE_WINDOWS
 else
 bfgminer_SOURCES += iospeeds.h iospeeds_posix.h
@@ -181,7 +177,11 @@ endif
 endif
 
 if HAVE_LIBUSB
-bfgminer_SOURCES += lowl-usb.c
+bfgminer_SOURCES += lowl-usb.c lowl-usb.h
+endif
+
+if NEED_BFG_BINLOADER
+bfgminer_SOURCES += binloader.c binloader.h
 endif
 
 if NEED_BFG_LOWLEVEL
@@ -214,6 +214,10 @@ if HAS_BIGPIC
 bfgminer_SOURCES += driver-bigpic.c driver-bigpic.h
 endif
 
+if HAS_TWINFURY
+bfgminer_SOURCES += driver-twinfury.c driver-twinfury.h
+endif
+
 if HAS_ICARUS
 bfgminer_SOURCES += driver-icarus.c icarus-common.h
 bfgminer_SOURCES += driver-cairnsmore.c
@@ -228,6 +232,10 @@ if USE_KNC
 bfgminer_SOURCES += driver-knc.c
 endif
 
+if HAS_KLONDIKE
+bfgminer_SOURCES += driver-klondike.c
+endif
+
 if HAS_MODMINER
 bfgminer_SOURCES += driver-modminer.c
 endif
@@ -238,6 +246,10 @@ endif
 
 if HAS_ZTEX
 bfgminer_SOURCES += driver-ztex.c libztex.c libztex.h
+endif
+
+if USE_BIFURY
+bfgminer_SOURCES += driver-bifury.c
 endif
 
 if HAS_BITFURY
@@ -261,6 +273,10 @@ endif
 
 if USE_HASHBUSTER
 bfgminer_SOURCES += driver-hashbuster.c
+endif
+
+if USE_HASHBUSTERUSB
+bfgminer_SOURCES += driver-hashbusterusb.c
 endif
 
 endif

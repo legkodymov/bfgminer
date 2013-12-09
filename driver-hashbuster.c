@@ -15,7 +15,6 @@
 
 #include "deviceapi.h"
 #include "driver-bitfury.h"
-#include "fpgautils.h"
 #include "libbitfury.h"
 #include "logging.h"
 #include "lowlevel.h"
@@ -142,7 +141,13 @@ bool hashbuster_spi_txrx(struct spi_port * const port)
 }
 
 static
-bool hashbuster_foundlowl(struct lowlevel_device_info * const info, __maybe_unused void *userp)
+bool hashbuster_lowl_match(const struct lowlevel_device_info * const info)
+{
+	return lowlevel_match_lowlproduct(info, &lowl_hid, HASHBUSTER_USB_PRODUCT);
+}
+
+static
+bool hashbuster_lowl_probe(const struct lowlevel_device_info * const info)
 {
 	const char * const product = info->product;
 	const char * const serial = info->serial;
@@ -151,11 +156,11 @@ bool hashbuster_foundlowl(struct lowlevel_device_info * const info, __maybe_unus
 	uint8_t buf[0x40] = {'\xfe'};
 	
 	if (info->lowl != &lowl_hid)
-		applogr(false, LOG_WARNING, "%s: Matched \"%s\" serial \"%s\", but lowlevel driver is not hid!",
+		applogr(false, LOG_DEBUG, "%s: Matched \"%s\" serial \"%s\", but lowlevel driver is not hid!",
 		       __func__, product, serial);
 	
 	if (info->vid != 0xFA04 || info->pid != 0x0011)
-		applogr(false, LOG_WARNING, "%s: Wrong VID/PID", __func__);
+		applogr(false, LOG_DEBUG, "%s: Wrong VID/PID", __func__);
 	
 	h = hid_open_path(path);
 	if (!h)
@@ -178,14 +183,14 @@ bool hashbuster_foundlowl(struct lowlevel_device_info * const info, __maybe_unus
 	
 	hid_close(h);
 	
-	if (bfg_claim_hid(&hashbuster_drv, true, info->path))
+	if (lowlevel_claim(&hashbuster_drv, true, info))
 		return false;
 	
 	struct cgpu_info *cgpu;
 	cgpu = malloc(sizeof(*cgpu));
 	*cgpu = (struct cgpu_info){
 		.drv = &hashbuster_drv,
-		.device_data = info,
+		.device_data = lowlevel_ref(info),
 		.threads = 1,
 		.procs = chip_n,
 		.device_path = strdup(info->path),
@@ -196,21 +201,6 @@ bool hashbuster_foundlowl(struct lowlevel_device_info * const info, __maybe_unus
 	};
 
 	return add_cgpu(cgpu);
-}
-
-static bool hashbuster_detect_one(const char *serial)
-{
-	return lowlevel_detect_serial(hashbuster_foundlowl, serial);
-}
-
-static int hashbuster_detect_auto()
-{
-	return lowlevel_detect(hashbuster_foundlowl, HASHBUSTER_USB_PRODUCT);
-}
-
-static void hashbuster_detect()
-{
-	serial_detect_auto(&hashbuster_drv, hashbuster_detect_one, hashbuster_detect_auto);
 }
 
 static
@@ -291,7 +281,8 @@ bool hashbuster_get_stats(struct cgpu_info * const cgpu)
 struct device_drv hashbuster_drv = {
 	.dname = "hashbuster",
 	.name = "HBR",
-	.drv_detect = hashbuster_detect,
+	.lowl_match = hashbuster_lowl_match,
+	.lowl_probe = hashbuster_lowl_probe,
 	
 	.thread_init = hashbuster_init,
 	.thread_disable = bitfury_disable,

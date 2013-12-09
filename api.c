@@ -60,7 +60,7 @@ static const char SEPARATOR = '|';
 #define SEPSTR "|"
 static const char GPUSEP = ',';
 
-static const char *APIVERSION = "2.1";
+static const char *APIVERSION = "2.3";
 static const char *DEAD = "Dead";
 static const char *SICK = "Sick";
 static const char *NOSTART = "NoStart";
@@ -771,6 +771,16 @@ static struct api_data *api_add_data_full(struct api_data *root, char *name, enu
 				api_data->data = (void *)malloc(strlen((char *)data) + 1);
 				strcpy((char*)(api_data->data), (char *)data);
 				break;
+			case API_UINT8:
+				/* Most OSs won't really alloc less than 4 */
+				api_data->data = malloc(4);
+				*(uint8_t *)api_data->data = *(uint8_t *)data;
+				break;
+			case API_UINT16:
+				/* Most OSs won't really alloc less than 4 */
+				api_data->data = malloc(4);
+				*(uint16_t *)api_data->data = *(uint16_t *)data;
+				break;
 			case API_INT:
 				api_data->data = (void *)malloc(sizeof(int));
 				*((int *)(api_data->data)) = *((int *)data);
@@ -844,6 +854,16 @@ struct api_data *api_add_string(struct api_data *root, char *name, const char *d
 struct api_data *api_add_const(struct api_data *root, char *name, const char *data, bool copy_data)
 {
 	return api_add_data_full(root, name, API_CONST, (void *)data, copy_data);
+}
+
+struct api_data *api_add_uint8(struct api_data *root, char *name, uint8_t *data, bool copy_data)
+{
+	return api_add_data_full(root, name, API_UINT8, (void *)data, copy_data);
+}
+
+struct api_data *api_add_uint16(struct api_data *root, char *name, uint16_t *data, bool copy_data)
+{
+	return api_add_data_full(root, name, API_UINT16, (void *)data, copy_data);
 }
 
 struct api_data *api_add_int(struct api_data *root, char *name, int *data, bool copy_data)
@@ -983,6 +1003,12 @@ static struct api_data *print_data(struct api_data *root, char *buf, bool isjson
 				sprintf(buf, "%s%s%s", quote, escape, quote);
 				if (escape != original)
 					free(escape);
+				break;
+			case API_UINT8:
+				sprintf(buf, "%u", *(uint8_t *)root->data);
+				break;
+			case API_UINT16:
+				sprintf(buf, "%u", *(uint16_t *)root->data);
 				break;
 			case API_INT:
 				sprintf(buf, "%d", *((int *)(root->data)));
@@ -1445,13 +1471,24 @@ static void devdetail_an(struct io_data *io_data, struct cgpu_info *cgpu, bool i
 
 	root = api_add_int(root, "DEVDETAILS", &n, true);
 	root = api_add_device_identifier(root, cgpu);
+	if (!per_proc)
+		root = api_add_int(root, "Processors", &cgpu->procs, false);
 	root = api_add_string(root, "Driver", cgpu->drv->dname, false);
 	if (cgpu->kname)
 		root = api_add_string(root, "Kernel", cgpu->kname, false);
 	if (cgpu->name)
 		root = api_add_string(root, "Model", cgpu->name, false);
+	if (cgpu->dev_manufacturer)
+		root = api_add_string(root, "Manufacturer", cgpu->dev_manufacturer, false);
+	if (cgpu->dev_product)
+		root = api_add_string(root, "Product", cgpu->dev_product, false);
+	if (cgpu->dev_serial)
+		root = api_add_string(root, "Serial", cgpu->dev_serial, false);
 	if (cgpu->device_path)
 		root = api_add_string(root, "Device Path", cgpu->device_path, false);
+	
+	root = api_add_int(root, "Target Temperature", &cgpu->targettemp, false);
+	root = api_add_int(root, "Cutoff Temperature", &cgpu->cutofftemp, false);
 
 	if (cgpu->drv->get_api_extra_device_detail)
 		root = api_add_extra(root, cgpu->drv->get_api_extra_device_detail(cgpu));
@@ -1965,6 +2002,7 @@ static void poolstatus(struct io_data *io_data, __maybe_unused SOCKETTYPE c, __m
 		root = api_add_uint(root, "Getworks", &(pool->getwork_requested), false);
 		root = api_add_int(root, "Accepted", &(pool->accepted), false);
 		root = api_add_int(root, "Rejected", &(pool->rejected), false);
+		root = api_add_int(root, "Works", &pool->works, false);
 		root = api_add_uint(root, "Discarded", &(pool->discarded_work), false);
 		root = api_add_uint(root, "Stale", &(pool->stale_shares), false);
 		root = api_add_uint(root, "Get Failures", &(pool->getfail_occasions), false);
@@ -3378,7 +3416,7 @@ struct CMDS {
 } cmds[] = {
 	{ "version",		apiversion,	false },
 	{ "config",		minerconfig,	false },
-	{ "devscan",		devscan,	false },
+	{ "devscan",		devscan,	true },
 	{ "devs",		devstatus,	false },
 	{ "procs",		devstatus,	false },
 	{ "pools",		poolstatus,	false },
@@ -3493,7 +3531,9 @@ static void send_result(struct io_data *io_data, SOCKETTYPE c, bool isjson)
 	if (isjson)
 		io_add(io_data, JSON_END);
 	
-	bytes_nullterminate(&io_data->data);
+	// Null-terminate reply, including sending the \0 on the socket
+	bytes_append(&io_data->data, "", 1);
+	
 	applog(LOG_DEBUG, "API: send reply: (%ld) '%.10s%s'",
 	       (long)bytes_len(&io_data->data),
 	       bytes_buf(&io_data->data),
@@ -3518,6 +3558,7 @@ static void tidyup(__maybe_unused void *arg)
 		shutdown(*apisock, SHUT_RDWR);
 		CLOSESOCKET(*apisock);
 		*apisock = INVSOCK;
+		free(apisock);
 	}
 
 	if (ipaccess != NULL) {
@@ -3906,7 +3947,7 @@ static void mcast()
 
 		count++;
 		came_from_siz = sizeof(came_from);
-		if (SOCKETFAIL(rep = recvfrom(mcast_sock, buf, sizeof(buf),
+		if (SOCKETFAIL(rep = recvfrom(mcast_sock, buf, sizeof(buf) - 1,
 						0, (struct sockaddr *)(&came_from), &came_from_siz))) {
 			applog(LOG_DEBUG, "API mcast failed count=%d (%s) (%d)",
 					count, SOCKERRMSG, (int)mcast_sock);
@@ -4046,10 +4087,6 @@ void api(int api_thr_id)
 			return;
 		}
 	}
-
-	/* This should be done before curl in needed
-	 * to ensure curl has already called WSAStartup() in windows */
-	cgsleep_ms(opt_log_interval*1000);
 
 	*apisock = socket(AF_INET, SOCK_STREAM, 0);
 	if (*apisock == INVSOCK) {

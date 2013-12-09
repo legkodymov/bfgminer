@@ -285,7 +285,7 @@ void bitfury_noop_job_start(struct thr_info __maybe_unused * const thr)
 void bitfury_init_freq_stat(struct freq_stat * const c, const int osc6_min, const int osc6_max)
 {
 	const int osc6_values = (osc6_max + 1 - osc6_min);
-	void * const p = malloc(osc6_values * (sizeof(*c->mh) + sizeof(*c->s)));
+	void * const p = calloc(osc6_values, (sizeof(*c->mh) + sizeof(*c->s)));
 	c->mh = p - (sizeof(*c->mh) * osc6_min);
 	c->s = p + (sizeof(*c->mh) * osc6_values) - (sizeof(*c->s) * osc6_min);
 	c->osc6_min = osc6_min;
@@ -501,6 +501,25 @@ void bitfury_do_io(struct thr_info * const master_thr)
 				ns = (double)period / (double)(cycles);
 				bitfury->mhz = 1.0 / ns * 65.0 * 1000.0;
 				
+				if (bitfury->mhz_best)
+				{
+					if (bitfury->mhz < bitfury->mhz_best / 2)
+					{
+						applog(LOG_WARNING, "%"PRIpreprv": Frequency drop over 50%% detected, reinitialising",
+						       proc->proc_repr);
+						bitfury->force_reinit = true;
+					}
+				}
+				if ((int)bitfury->mhz > bitfury->mhz_best && bitfury->mhz_last > bitfury->mhz_best)
+				{
+					// mhz_best is the lowest of two sequential readings over the previous best
+					if ((int)bitfury->mhz > bitfury->mhz_last)
+						bitfury->mhz_best = bitfury->mhz_last;
+					else
+						bitfury->mhz_best = bitfury->mhz;
+				}
+				bitfury->mhz_last = bitfury->mhz;
+				
 				bitfury->counter1 = counter;
 				copy_time(&(bitfury->timer1), &tv_now);
 			}
@@ -532,6 +551,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 				if (opt_debug && !c->best_done)
 				{
 					char logbuf[0x100];
+					logbuf[0] = '\0';
 					for (i = c->osc6_min; i <= c->osc6_max; ++i)
 						tailsprintf(logbuf, sizeof(logbuf), " %d=%.3f/%3.0fs",
 						            i, c->mh[i] / c->s[i], c->s[i]);
@@ -601,6 +621,8 @@ out:
 			       proc->proc_repr);
 			bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
 			bitfury->desync_counter = 99;
+			bitfury->mhz_last = 0;
+			bitfury->mhz_best = 0;
 			bitfury->force_reinit = false;
 		}
 		if (timer_elapsed(tvp_stat, &tv_now) >= 60)

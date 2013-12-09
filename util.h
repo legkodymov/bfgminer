@@ -113,8 +113,8 @@ extern json_t *json_rpc_call_completed(CURL *, int rc, bool probe, int *rolltime
 
 extern char *absolute_uri(char *uri, const char *ref);  // ref must be a root URI
 
-extern void ucs2tochar(char *out, const uint16_t *in, size_t sz);
-extern char *ucs2tochar_dup(uint16_t *in, size_t sz);
+extern size_t ucs2_to_utf8(char *out, const uint16_t *in, size_t sz);
+extern char *ucs2_to_utf8_dup(uint16_t *in, size_t sz);
 
 #define BFGINIT(var, val)  do{  \
 	if (!(var))       \
@@ -219,12 +219,22 @@ size_t bytes_len(const bytes_t *b)
 	return b->sz;
 }
 
+static inline
+ssize_t bytes_find(const bytes_t * const b, const uint8_t needle)
+{
+	const size_t blen = bytes_len(b);
+	const uint8_t * const buf = bytes_buf(b);
+	for (int i = 0; i < blen; ++i)
+		if (buf[i] == needle)
+			return i;
+	return -1;
+}
+
 extern void _bytes_alloc_failure(size_t);
 
 static inline
-void bytes_resize(bytes_t *b, size_t newsz)
+void bytes_extend_buf(bytes_t * const b, const size_t newsz)
 {
-	b->sz = newsz;
 	if (newsz <= b->allocsz)
 		return;
 	
@@ -239,11 +249,33 @@ void bytes_resize(bytes_t *b, size_t newsz)
 }
 
 static inline
-void bytes_append(bytes_t *b, const void *add, size_t addsz)
+void bytes_resize(bytes_t * const b, const size_t newsz)
+{
+	bytes_extend_buf(b, newsz);;
+	b->sz = newsz;
+}
+
+static inline
+void *bytes_preappend(bytes_t * const b, const size_t addsz)
+{
+	size_t origsz = bytes_len(b);
+	bytes_extend_buf(b, origsz + addsz);
+	return &bytes_buf(b)[origsz];
+}
+
+static inline
+void bytes_postappend(bytes_t * const b, const size_t addsz)
 {
 	size_t origsz = bytes_len(b);
 	bytes_resize(b, origsz + addsz);
-	memcpy(&bytes_buf(b)[origsz], add, addsz);
+}
+
+static inline
+void bytes_append(bytes_t * const b, const void * const add, const size_t addsz)
+{
+	void * const appendbuf = bytes_preappend(b, addsz);
+	memcpy(appendbuf, add, addsz);
+	bytes_postappend(b, addsz);
 }
 
 static inline
@@ -272,6 +304,11 @@ void bytes_cpy(bytes_t *dst, const bytes_t *src)
 static inline
 void bytes_shift(bytes_t *b, size_t shift)
 {
+	if (shift >= b->sz)
+	{
+		b->sz = 0;
+		return;
+	}
 	b->sz -= shift;
 	memmove(bytes_buf(b), &bytes_buf(b)[shift], bytes_len(b));
 }
@@ -362,6 +399,8 @@ long timer_elapsed_us(const struct timeval *tvp_timer, const struct timeval *tvp
 	return timeval_to_us(&tv);
 }
 
+#define ms_tdiff(end, start)  (timer_elapsed_us(start, end) / 1000)
+
 static inline
 int timer_elapsed(const struct timeval *tvp_timer, const struct timeval *tvp_now)
 {
@@ -425,6 +464,15 @@ struct timeval *select_timeout(struct timeval *tvp_timeout, struct timeval *tvp_
 }while(0)
 
 #define _SNP(...)  _SNP2(snprintf, __VA_ARGS__)
+
+
+#define REPLACEMENT_CHAR (0xFFFD)
+#define U8_DEGREE "\xc2\xb0"
+#define U8_HLINE  "\xe2\x94\x80"
+#define U8_BTEE   "\xe2\x94\xb4"
+extern int32_t utf8_decode(const void *, int *out_len);
+extern void utf8_test();
+
 
 
 #define RUNONCE(rv)  do {  \
