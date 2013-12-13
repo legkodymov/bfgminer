@@ -1,40 +1,18 @@
-/*
- * Copyright 2013 gluk <glukolog@mail.ru>
- *
- * Permission is hereby granted, free of charge, to any person obtaining a copy
- * of this software and associated documentation files (the "Software"), to deal
- * in the Software without restriction, including without limitation the rights
- * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
- * copies of the Software, and to permit persons to whom the Software is
- * furnished to do so, subject to the following conditions:
- *
- * The above copyright notice and this permission notice shall be included in
- * all copies or substantial portions of the Software.
- *
- * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
- * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
- * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
- * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
- * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
- * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN
- * THE SOFTWARE.
- */
-
-#include "config.h"
-
 #include <fcntl.h>
 #include <sys/ioctl.h>
+#include <linux/i2c.h>
+#include <linux/i2c-dev.h>
+#include "tm_i2c.h"
+#include <sys/mman.h>
+#include <stdio.h>
 #include <unistd.h>
 
-#ifdef NEED_LINUX_I2C_H
-#include <linux/i2c.h>
-#endif
-#include <linux/i2c-dev.h>
+static volatile unsigned *gpiom;
 
-#include "logging.h"
-#include "tm_i2c.h"
-
-static int tm_i2c_fd;
+#define INP_GPIO(g) *(gpiom+((g)/10)) &= ~(7<<(((g)%10)*3))
+#define OUT_GPIO(g) *(gpiom+((g)/10)) |=  (1<<(((g)%10)*3))
+#define GPIO_SET *(gpiom+7)
+#define GPIO_CLR *(gpiom+10)
 
 float tm_i2c_Data2Temp(unsigned int ans) {
 	float t = ans;
@@ -47,10 +25,28 @@ float tm_i2c_Data2Core(unsigned int ans) {
 }
 
 int tm_i2c_init() {
-	if ((tm_i2c_fd = open("/dev/i2c-1", O_RDWR)) < 0)
-		return 1;
-	else
-		return 0;
+	int i;
+	int fd;
+
+	fd = open("/dev/mem",O_RDWR|O_SYNC);
+	if (fd < 0) { perror("/dev/mem trouble"); exit(1); }
+	gpiom = mmap(0,4096,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0x20200000);
+	if (gpiom == MAP_FAILED) { perror("gpio mmap trouble"); exit(1); }
+	close(fd);
+
+	INP_GPIO(17); OUT_GPIO(17);
+	INP_GPIO(18); OUT_GPIO(18);
+	for(i = 0; i < 4 ; i++) {
+		INP_GPIO(i + 22); OUT_GPIO(i + 22);
+		GPIO_CLR = 1 << (i + 22);
+	}
+	INP_GPIO(27); OUT_GPIO(27);
+
+	GPIO_CLR = 1 << 27;
+	usleep(1);
+	GPIO_SET = 1 << 27;
+
+
 }
 
 void tm_i2c_close() {
@@ -65,7 +61,7 @@ unsigned int tm_i2c_req(int fd, unsigned char addr, unsigned char cmd, unsigned 
 	struct i2c_rdwr_ioctl_data msg_rdwr;
 	unsigned int ret;
 
-	//applog(LOG_DEBUG, "REQ from %02X cmd: %02X", addr, cmd);
+	//printf("REQ from %02X cmd: %02X\n", addr, cmd);
 
 	tm->cmd = cmd;
 	tm->data_lsb = data & 0xFF;
@@ -75,7 +71,7 @@ unsigned int tm_i2c_req(int fd, unsigned char addr, unsigned char cmd, unsigned 
 	msg.addr = addr;
 	msg.flags = 0;
 	msg.len = 3;
-	msg.buf = (void*)tm;
+	msg.buf = buf;
 	msg_rdwr.msgs = &msg;
 	msg_rdwr.nmsgs = 1;
 	if ((i = ioctl(fd, I2C_RDWR, &msg_rdwr)) < 0) {
@@ -87,7 +83,7 @@ unsigned int tm_i2c_req(int fd, unsigned char addr, unsigned char cmd, unsigned 
 	msg.addr = addr;
 	msg.flags = I2C_M_RD;
 	msg.len = 3;
-	msg.buf = (void*)tm;
+	msg.buf = buf;
 	msg_rdwr.msgs = &msg;
 	msg_rdwr.nmsgs = 1;
 	if ((i = ioctl(fd, I2C_RDWR, &msg_rdwr)) < 0) {
@@ -102,8 +98,9 @@ unsigned int tm_i2c_req(int fd, unsigned char addr, unsigned char cmd, unsigned 
 }
 
 int tm_i2c_detect(unsigned char slot) {
-	if (slot < 0 || slot > 31) return 0;
-	return tm_i2c_req(tm_i2c_fd, (TM_ADDR >> 1) + slot, TM_GET_CORE0, 0);
+	if (slot < 0 || slot > 15) return 0;
+	//return tm_i2c_req(tm_i2c_fd, (TM_ADDR >> 1) + (slot >> 1), TM_GET_CORE0, 0);
+	return 1;
 }
 
 float tm_i2c_getcore0(unsigned char slot) {
@@ -120,7 +117,7 @@ float tm_i2c_gettemp(unsigned char slot) {
 	if (slot < 0 || slot > 31) return 0;
 	return tm_i2c_Data2Temp(tm_i2c_req(tm_i2c_fd, (TM_ADDR >> 1) + slot, TM_GET_TEMP, 0));
 }
-
+/*
 void tm_i2c_set_oe(unsigned char slot) {
 	if (slot < 0 || slot > 31) return;
 	tm_i2c_req(tm_i2c_fd, (TM_ADDR >> 1) + slot, TM_SET_OE, 0);
@@ -130,9 +127,43 @@ void tm_i2c_clear_oe(unsigned char slot) {
 	if (slot < 0 || slot > 31) return;
 	tm_i2c_req(tm_i2c_fd, (TM_ADDR >> 1) + slot, TM_SET_OE, 1);
 }
+*/
+void tm_i2c_set_oe(unsigned char slot) {
+	int i;
+
+	if (slot < 0 || slot > 15) return;
+	for(i = 0 ; i < 4 ; i++) {
+		if (slot & (1 << i)) GPIO_SET = 1 << (i + 22);
+		else GPIO_CLR = 1 << (i + 22);
+	}
+	GPIO_CLR = 1 << 27;
+}
+
+void tm_i2c_clear_oe(unsigned char slot) {
+	if (slot < 0 || slot > 15) return;
+	GPIO_SET = 1 << 27;
+}
 
 unsigned char tm_i2c_slot2addr(unsigned char slot) {
 	if (slot < 0 || slot > 31) return 0;
 	return ((TM_ADDR >> 1) + slot);
 }
 
+void out_led(int * led_c) {
+	int i, j;
+
+	GPIO_SET = 1 << 17;
+	GPIO_SET = 1 << 18;
+	GPIO_CLR = 1 << 18;
+	for (j = 0; j < 8; j++) {
+		if (led_c[7 - j]) {
+			GPIO_CLR = 1 << 17;
+		} else {
+			GPIO_SET = 1 << 17;
+		}
+		GPIO_SET = 1 << 18;
+		GPIO_CLR = 1 << 18;
+	}
+		GPIO_SET = 1 << 18;
+	return;
+}

@@ -36,6 +36,7 @@
 #include "libbitfury.h"
 #include "util.h"
 #include "spidevc.h"
+#include "tm_i2c.h"
 
 BFG_REGISTER_DRIVER(bitfury_drv)
 
@@ -81,7 +82,7 @@ void *bitfury_just_io(struct bitfury_device * const bitfury)
 	struct spi_port * const spi = bitfury->spi;
 	const int chip = bitfury->fasync;
 	void *rv;
-	
+
 	spi_clear_buf(spi);
 	spi_emit_break(spi);
 	spi_emit_fasync(spi, chip);
@@ -337,15 +338,68 @@ int bitfury_select_freq(struct bitfury_device *bitfury, struct cgpu_info *proc) 
 			}
 			c->best_done = 1;
 			c->best_osc = freq;
-			applog(LOG_DEBUG, "%"PRIpreprv": best_osc = %d",
+			applog(LOG_WARNING, "%"PRIpreprv": best_osc = %d",
 			       proc->proc_repr, freq);
 		}
 	}
-	applog(LOG_DEBUG, "%"PRIpreprv": Changing osc6_bits to %d",
+	applog(LOG_WARNING, "%"PRIpreprv": Changing osc6_bits to %d",
 	       proc->proc_repr, freq);
 	bitfury->osc6_bits = freq;
 	bitfury_send_freq(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
 	return 0;
+}
+
+void blink_led(struct thr_info * const master_thr) {
+	struct cgpu_info *proc;
+	struct thr_info *thr;
+	struct bitfury_device *bitfury;
+	unsigned int ghs[32];
+	struct freq_stat *c;
+	int i;
+	static int skip = 0;
+	static unsigned int led_t[8];
+	unsigned int led_c[8];
+	static unsigned counter;
+
+	skip = (skip + 1) & 0xF;
+	if (!skip) {
+		bitfury = proc->device_data;
+		c = &bitfury->chip_stat;
+	
+		for (i = 0; i < 32; i++) {
+			ghs[i] = 0;
+		}
+	
+//		printf("AAA blink led\n");
+		for (proc = master_thr->cgpu; proc; proc = proc->next_proc) {
+			double mh_actual = proc->total_mhashes / total_secs;
+	//		printf("AAA proc->cgminer_id: %d, proc->device_id: %d, mh_actual: %f, rolling: %f\n", proc->cgminer_id, proc->device_id, mh_actual, proc->rolling);
+			ghs[proc->device_id] += proc->rolling;
+		}
+		for (i = 0; i < 8; i++) {
+			int j = i * 2;
+			int sum = ghs[j] + ghs[j + 1];
+			if (sum > 28000) {
+				led_t[i] = 4;
+			} else if (sum > 20000) {
+				led_t[i] = 1;
+			} else if (ghs[j] < 10000 || ghs[j+1] < 10000) {
+				led_t[i] = 0;
+			}
+//			printf("AAA gh[%d]: %d, sum: %d, led_t: %d\n", j, ghs[j], sum, led_t[i]);
+		}
+	}
+//	printf("AAA ");
+	for (i = 0; i < 8; i++) {
+		led_c[i] = (counter < led_t[i]) ? 1 : 0;
+//		printf("%d", led_c[i]); //AAA
+	}
+//	printf("\n"); //AAA
+
+	out_led(led_c);
+
+	counter = (counter + 1) & 0x3;
+
 }
 
 void bitfury_do_io(struct thr_info * const master_thr)
@@ -364,7 +418,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 	struct timeval tv_now;
 	uint32_t counter;
 	struct timeval *tvp_stat;
-	
+
 	for (proc = master_thr->cgpu; proc; proc = proc->next_proc)
 		++n_chips;
 	
@@ -380,9 +434,9 @@ void bitfury_do_io(struct thr_info * const master_thr)
 	{
 		thr = proc->thr[0];
 		bitfury = proc->device_data;
-		
+
 		should_be_running = (proc->deven == DEV_ENABLED && !thr->pause);
-		
+
 		if (should_be_running || thr->_job_transition_in_progress)
 		{
 			if (spi != bitfury->spi)
@@ -418,6 +472,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 		rxbuf[j] = rxbuf_copy[j];
 	}
 	
+	blink_led(master_thr);
 	for (j = 0; j < n_chips; ++j)
 	{
 		proc = procs[j];
@@ -539,7 +594,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 				// Copy current statistics
 				mh_diff = bitfury->counter2 - c->omh;
 				s_diff = total_secs - c->os;
-				applog(LOG_DEBUG, "%"PRIpreprv": %.0f completed in %f seconds",
+				applog(LOG_WARNING, "%"PRIpreprv": %.0f completed in %f seconds",
 				       proc->proc_repr, mh_diff, s_diff);
 				if (osc >= c->osc6_min && osc <= c->osc6_max)
 				{
@@ -563,7 +618,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 				if (!c->best_done) {
 					bitfury_select_freq(bitfury, proc);
 				} else {
-					applog(LOG_DEBUG, "%"PRIpreprv": Stable freq, osc6_bits: %d",
+					applog(LOG_WARNING, "%"PRIpreprv": Stable freq, osc6_bits: %d",
 					       proc->proc_repr, bitfury->osc6_bits);
 				}
 			}
@@ -629,7 +684,7 @@ out:
 			copy_time(tvp_stat, &tv_now);
 	}
 	
-	timer_set_delay_from_now(&master_thr->tv_poll, 10000);
+	timer_set_delay_from_now(&master_thr->tv_poll, 100000);
 }
 
 int64_t bitfury_job_process_results(struct thr_info *thr, struct work *work, bool stopping)

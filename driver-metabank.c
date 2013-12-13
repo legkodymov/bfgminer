@@ -89,7 +89,7 @@ int metabank_autodetect()
 		cgsleep_ms(1);
 	}
 
-	for (i = 0; i < 32; i++) {
+	for (i = 0; i < 16; i++) {
 		if (slot_on[i]) {
 			int chip_n;
 			
@@ -183,7 +183,8 @@ static bool metabank_get_stats(struct cgpu_info *cgpu)
 	struct bitfury_device * const bitfury = cgpu->device_data;
 	float t;
 
-	t = tm_i2c_gettemp(bitfury->slot) * 0.1;
+//	t = tm_i2c_gettemp(bitfury->slot) * 0.1; //AAA
+	t = 25.0;
 
 	if (t < -27) //Sometimes tm_i2c_gettemp() returns strange result, ignoring it.
 		return false;

@@ -257,6 +257,7 @@ int libbitfury_detect_chip(struct spi_port *port, int chip_n) {
 		if (ocounter) {
 			unsigned int cdiff = libbitfury_c_diff(ocounter, counter);
 
+			printf("AAA cdiff: %d, odiff: %d\n", cdiff, odiff);
 			if (cdiff > 5000 && cdiff < 100000 && odiff > 5000 && odiff < 100000)
 				return 1;
 			odiff = cdiff;
@@ -274,7 +275,8 @@ int libbitfury_detect_chip(struct spi_port *port, int chip_n) {
 int libbitfury_detectChips1(struct spi_port *port) {
 	int n;
 	for (n = 0; libbitfury_detect_chip(port, n); ++n)
-	{}
+	{
+	}
 	return n;
 }
 
