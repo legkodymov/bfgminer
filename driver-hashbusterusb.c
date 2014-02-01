@@ -206,10 +206,10 @@ bool hashbusterusb_lowl_probe(const struct lowlevel_device_info * const info)
 	port->speed = 100000;
 	port->mode = 0;
 	
-	chip_n = libbitfury_detectChips1(port);
+	chip_n = libbitfury_detectChips1(port, 8);
 
 	if (unlikely(!chip_n))
-		chip_n = libbitfury_detectChips1(port);
+		chip_n = libbitfury_detectChips1(port, 8);
 
 	if (unlikely(!chip_n))
 	{

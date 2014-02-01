@@ -39,8 +39,8 @@
 
 #include <time.h>
 
-#define BITFURY_REFRESH_DELAY 100
-#define BITFURY_DETECT_TRIES 3000 / BITFURY_REFRESH_DELAY
+#define BITFURY_REFRESH_DELAY 10
+#define BITFURY_DETECT_TRIES 1000 / BITFURY_REFRESH_DELAY
 
 unsigned bitfury_decnonce(unsigned in);
 
@@ -162,11 +162,11 @@ void bitfury_send_reinit(struct spi_port *port, int slot, int chip_n, int n) {
 }
 
 void bitfury_send_shutdown(struct spi_port *port, int slot, int chip_n) {
-	spi_clear_buf(port);
-	spi_emit_break(port);
-	spi_emit_fasync(port, chip_n);
-	bitfury_config_reg(port, 4, 0); /* Disable slow oscillator */
-	spi_txrx(port);
+//	spi_clear_buf(port);
+//	spi_emit_break(port);
+//	spi_emit_fasync(port, chip_n);
+//	bitfury_config_reg(port, 4, 0); /* Disable slow oscillator */
+//	spi_txrx(port);
 }
 
 void bitfury_send_freq(struct spi_port *port, int slot, int chip_n, int bits) {
@@ -190,6 +190,10 @@ int libbitfury_get_counter(unsigned int *newbuf, unsigned int *oldbuf) {
 			unsigned counter = bitfury_decnonce(newbuf[j]);
 			if ((counter & 0xFFC00000) == 0xdf800000) {
 				counter -= 0xdf800000;
+				return counter;
+			}
+			if ((counter & 0xFFC00000) == 0xbf800000) {
+				counter -= 0xbf800000;
 				return counter;
 			}
 		}
@@ -237,15 +241,18 @@ int libbitfury_detect_chip(struct spi_port *port, int chip_n) {
 	spi_clear_buf(port);
 	spi_emit_break(port); /* First we want to break chain! Otherwise we'll get all of traffic bounced to output */
 	spi_emit_fasync(port, chip_n);
-	bitfury_set_freq(port, 52);  //54 - 3F, 53 - 1F
+	bitfury_set_freq(port, 54);  //54 - 3F, 53 - 1F
 	bitfury_send_conf(port);
 	bitfury_send_init(port);
 	spi_txrx(port);
 
+//	printf("AAA detect chip_n: %d\n", chip_n);
 	ocounter = 0;
 	for (i = 0; i < BITFURY_DETECT_TRIES; i++) {
 		int counter;
+		int x;
 
+//		printf("AAA 0\n");
 		spi_clear_buf(port);
 		spi_emit_break(port);
 		spi_emit_fasync(port, chip_n);
@@ -257,26 +264,46 @@ int libbitfury_detect_chip(struct spi_port *port, int chip_n) {
 		if (ocounter) {
 			unsigned int cdiff = libbitfury_c_diff(ocounter, counter);
 
-			printf("AAA cdiff: %d, odiff: %d\n", cdiff, odiff);
-			if (cdiff > 5000 && cdiff < 100000 && odiff > 5000 && odiff < 100000)
+//			printf("AAA cdiff: %d, odiff: %d\n", cdiff, odiff);
+			if (cdiff > 500*BITFURY_REFRESH_DELAY &&
+				cdiff < 4000*BITFURY_REFRESH_DELAY &&
+				odiff > 500*BITFURY_REFRESH_DELAY &&
+				odiff < 4000*BITFURY_REFRESH_DELAY)
 				return 1;
 			odiff = cdiff;
 		}
+//		if ((newbuf[16] == 0 && oldbuf[16] == 0xFFFFFFFF) ||
+//            (newbuf[16] == 0xFFFFFFFF && oldbuf[16] == 0)) {
+//			printf("AAA JOB SWITCH!\n");
+//			return 1;
+//		}
+
 		ocounter = counter;
+//		for (x = 0; x < 17; x++) {
+//			printf(" %08x", newbuf[x]);
+//		}
+//		printf("\n");
 		if (newbuf[16] != 0 && newbuf[16] != 0xFFFFFFFF) {
-			return 0;
+//			printf("AAA newbuf[16]: %d\n", newbuf[16]);
+//			return 0;
 		}
-		cgsleep_ms(BITFURY_REFRESH_DELAY / 10);
+		cgsleep_ms(BITFURY_REFRESH_DELAY);
 		memcpy(oldbuf, newbuf, 17 * 4);
 	}
 	return 0;
 }
 
-int libbitfury_detectChips1(struct spi_port *port) {
-	int n;
-	for (n = 0; libbitfury_detect_chip(port, n); ++n)
-	{
+int libbitfury_detectChips1(struct spi_port *port, int should_be) {
+	int n = 0;
+	int attempt;
+
+	for (attempt = 0; attempt < 1 && n != should_be; attempt++) {
+		for (n = 0; n < should_be && libbitfury_detect_chip(port, n); ++n)
+		{
+		}
+		printf("AAA attempt: %d, n: %d, should_be: %d\n", attempt, n, should_be);
 	}
+	if (n != should_be) n = 0;
 	return n;
 }
 

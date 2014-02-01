@@ -73,7 +73,7 @@ int bfsb_autodetect()
 		slot_on[i] = 1;
 	}
 
-	for (i = 0; i < 32; i++) {
+	for (i = 0; i < 1; i++) {
 		if (slot_on[i]) {
 			int chip_n;
 			
@@ -84,7 +84,7 @@ int bfsb_autodetect()
 			port->speed = 625000;
 			dummy_bitfury.slot = i;
 			
-			chip_n = libbitfury_detectChips1(port);
+			chip_n = libbitfury_detectChips1(port, 8);
 			if (chip_n)
 			{
 				applog(LOG_WARNING, "BITFURY slot %d: %d chips detected", i, chip_n);

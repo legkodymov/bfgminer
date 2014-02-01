@@ -56,7 +56,7 @@ int bitfury_autodetect()
 	spi_init();
 	if (!sys_spi)
 		return 0;
-	chip_n = libbitfury_detectChips1(sys_spi);
+	chip_n = libbitfury_detectChips1(sys_spi, 8);
 	if (!chip_n) {
 		applog(LOG_WARNING, "No Bitfury chips detected!");
 		return 0;
@@ -122,6 +122,7 @@ tryagain:
 		applog(LOG_ERR, "%"PRIpreprv": %s: Giving up after %d tries",
 		       proc->proc_repr, __func__, tried);
 		bitfury->desync_counter = 99;
+		bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
 		return false;
 	}
 	++tried;
@@ -206,7 +207,7 @@ void bitfury_disable(struct thr_info * const thr)
 	struct cgpu_info * const proc = thr->cgpu;
 	struct bitfury_device * const bitfury = proc->device_data;
 	
-	applog(LOG_DEBUG, "%"PRIpreprv": Shutting down chip (disable)", proc->proc_repr);
+	applog(LOG_WARNING, "%"PRIpreprv": Shutting down chip (disable)", proc->proc_repr);
 	bitfury_send_shutdown(bitfury->spi, bitfury->slot, bitfury->fasync);
 }
 
@@ -502,13 +503,13 @@ void bitfury_do_io(struct thr_info * const master_thr)
 		if (newbuf[0xf] != oldbuf[0xf])
 		{
 			inc_hw_errors2(thr, NULL, NULL);
-			if (unlikely(++bitfury->desync_counter >= 4))
-			{
-				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
-				       proc->proc_repr);
-				bitfury_init_oldbuf(proc, inp);
-				continue;
-			}
+//			if (unlikely(++bitfury->desync_counter >= 4))
+//			{
+//				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
+//				       proc->proc_repr);
+//				bitfury_init_oldbuf(proc, inp);
+//				continue;
+//			}
 			applog(LOG_DEBUG, "%"PRIpreprv": Previous nonce mismatch, ignoring response",
 			       proc->proc_repr);
 			goto out;
@@ -529,9 +530,9 @@ void bitfury_do_io(struct thr_info * const master_thr)
 			if (unlikely(n >= 0xf))
 			{
 				inc_hw_errors2(thr, NULL, NULL);
-				applog(LOG_DEBUG, "%"PRIpreprv": Full result match, reinitialising",
-				       proc->proc_repr);
-				bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+//				applog(LOG_DEBUG, "%"PRIpreprv": Full result match, reinitialising",
+//				       proc->proc_repr);
+//				bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
 				bitfury->desync_counter = 99;
 				goto out;
 			}
@@ -558,12 +559,12 @@ void bitfury_do_io(struct thr_info * const master_thr)
 				
 				if (bitfury->mhz_best)
 				{
-					if (bitfury->mhz < bitfury->mhz_best / 2)
-					{
-						applog(LOG_WARNING, "%"PRIpreprv": Frequency drop over 50%% detected, reinitialising",
-						       proc->proc_repr);
-						bitfury->force_reinit = true;
-					}
+//					if (bitfury->mhz < bitfury->mhz_best / 2)
+//					{
+//						applog(LOG_WARNING, "%"PRIpreprv": Frequency drop over 50%% detected, reinitialising",
+//						       proc->proc_repr);
+//						bitfury->force_reinit = true;
+//					}
 				}
 				if ((int)bitfury->mhz > bitfury->mhz_best && bitfury->mhz_last > bitfury->mhz_best)
 				{
@@ -654,9 +655,9 @@ void bitfury_do_io(struct thr_info * const master_thr)
 				{
 					if (bitfury->sample_hwe >= 8)
 					{
-						applog(LOG_WARNING, "%"PRIpreprv": %d of the last %d results were bad, reinitialising",
-						       proc->proc_repr, bitfury->sample_hwe, bitfury->sample_tot);
-						bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+//						applog(LOG_WARNING, "%"PRIpreprv": %d of the last %d results were bad, reinitialising",
+//						       proc->proc_repr, bitfury->sample_hwe, bitfury->sample_tot);
+//						bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
 						bitfury->desync_counter = 99;
 					}
 					bitfury->sample_tot = bitfury->sample_hwe = 0;
