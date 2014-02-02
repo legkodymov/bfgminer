@@ -140,7 +140,7 @@ bool sys_spi_txrx(struct spi_port *port)
 	struct spi_ioc_transfer tr[16];
 
 	memset(&tr,0,sizeof(tr));
-	mode = 0; bits = 8; speed = 1000000;
+	mode = 0; bits = 8; speed = 500000;
 	if (port->speed)
 		speed = port->speed;
 

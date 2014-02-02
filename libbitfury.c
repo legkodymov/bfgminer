@@ -303,7 +303,7 @@ int libbitfury_detectChips1(struct spi_port *port, int should_be) {
 		}
 		printf("AAA attempt: %d, n: %d, should_be: %d\n", attempt, n, should_be);
 	}
-	if (n != should_be) n = 0;
+//	if (n != should_be) n = 0;
 	return n;
 }
 
