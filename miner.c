@@ -7542,7 +7542,7 @@ static void hashmeter(int thr_id, struct timeval *diff,
 
 				get_statline(logline, sizeof(logline), cgpu);
 				if (!curses_active) {
-					printf("%s          \r", logline);
+					printf("%s          \n", logline);
 					fflush(stdout);
 				} else
 					applog(LOG_INFO, "%s", logline);
@@ -7676,7 +7676,7 @@ out_unlock:
 
 	if (showlog) {
 		if (!curses_active) {
-			printf("%s          \r", logstatusline);
+			printf("%s          \n", logstatusline);
 			fflush(stdout);
 		} else
 			applog(LOG_INFO, "%s", logstatusline);

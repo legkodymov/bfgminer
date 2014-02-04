@@ -40,6 +40,8 @@
 
 BFG_REGISTER_DRIVER(bitfury_drv)
 
+#define DEBUG_CHIP 1200
+
 static
 int bitfury_autodetect()
 {
@@ -499,19 +501,33 @@ void bitfury_do_io(struct thr_info * const master_thr)
 		memcpy(&newbuf[0], &inp[bitfury->active], 4 * (0x10 - bitfury->active));
 		memcpy(&newbuf[0x10 - bitfury->active], &inp[0], 4 * bitfury->active);
 		newjob = inp[0x10];
+
+		if (j == DEBUG_CHIP) { 
+			int x;
+			printf("AAA chip %d: ", j);
+			for (x = 0; x < 17; x++) {
+				printf(" %08x", newbuf[x]);
+			}
+			printf("\n");
+		}
 		
 		if (newbuf[0xf] != oldbuf[0xf])
 		{
-			inc_hw_errors2(thr, NULL, NULL);
-			if (unlikely(++bitfury->desync_counter >= 4))
-			{
-				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
-				       proc->proc_repr);
-				bitfury_init_oldbuf(proc, inp);
-				continue;
+			if (j == DEBUG_CHIP) { 
+				printf("AAA chip %d: %08x != %08x\n", j, newbuf[0xf],  oldbuf[0xf]);
 			}
-			applog(LOG_DEBUG, "%"PRIpreprv": Previous nonce mismatch, ignoring response",
-			       proc->proc_repr);
+			memcpy(newbuf, oldbuf, 17 *4);
+
+//			inc_hw_errors2(thr, NULL, NULL);
+//			if (unlikely(++bitfury->desync_counter >= 4))
+//			{
+//				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
+//				       proc->proc_repr);
+//				bitfury_init_oldbuf(proc, inp);
+//				continue;
+//			}
+//			applog(LOG_DEBUG, "%"PRIpreprv": Previous nonce mismatch, ignoring response",
+//			       proc->proc_repr);
 			goto out;
 		}
 		else
@@ -627,6 +643,9 @@ void bitfury_do_io(struct thr_info * const master_thr)
 		
 		if (n)
 		{
+			if (j == DEBUG_CHIP) {
+				printf("AAA SOLUTIONS: %d\n", n);
+			}
 			for (i = 0; i < n; ++i)
 			{
 				nonce = bitfury_decnonce(newbuf[i]);
@@ -636,6 +655,9 @@ void bitfury_do_io(struct thr_info * const master_thr)
 					       proc->proc_repr, i, (unsigned long)nonce, thr->work);
 					submit_nonce(thr, thr->work, nonce);
 					bitfury->counter2 += 1;
+					if (j == DEBUG_CHIP) {
+						printf("AAA SUBMIT: %d, nonce: %08x\n", i, nonce);
+					}
 				}
 				else
 				if (fudge_nonce(thr->prev_work, &nonce))
@@ -644,9 +666,15 @@ void bitfury_do_io(struct thr_info * const master_thr)
 					       proc->proc_repr, i, (unsigned long)nonce, thr->prev_work);
 					submit_nonce(thr, thr->prev_work, nonce);
 					bitfury->counter2 += 1;
+					if (j == DEBUG_CHIP) {
+						printf("AAA PREV_SUBMIT: %d, nonce: %08x\n", i, nonce);
+					}
 				}
 				else
 				{
+					if (j == DEBUG_CHIP) {
+						printf("AAA STRANGE+1: %d, nonce: %08x\n", j, nonce);
+					}
 					inc_hw_errors(thr, thr->work, nonce);
 					++bitfury->sample_hwe;
 					bitfury->strange_counter += 1;
@@ -685,7 +713,7 @@ out:
 			copy_time(tvp_stat, &tv_now);
 	}
 	
-	timer_set_delay_from_now(&master_thr->tv_poll, 10000);
+	timer_set_delay_from_now(&master_thr->tv_poll, 10000000 / n_chips);
 }
 
 int64_t bitfury_job_process_results(struct thr_info *thr, struct work *work, bool stopping)
