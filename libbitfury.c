@@ -295,15 +295,17 @@ int libbitfury_detect_chip(struct spi_port *port, int chip_n) {
 
 int libbitfury_detectChips1(struct spi_port *port, int should_be) {
 	int n = 0;
-	int attempt;
+	int attempt = 0;
+	int attempt_n = 3;
 
-	for (attempt = 0; attempt < 1 && n != should_be; attempt++) {
-		for (n = 0; n < should_be && libbitfury_detect_chip(port, n); ++n)
-		{
+	do {
+		if (libbitfury_detect_chip(port, n)) {
+			n++; attempt = 0;
+		} else {
+			attempt++;
 		}
 		printf("AAA attempt: %d, n: %d, should_be: %d\n", attempt, n, should_be);
-	}
-//	if (n != should_be) n = 0;
+	} while (attempt < attempt_n && n != should_be);
 	return n;
 }
 

@@ -103,7 +103,7 @@ int metabank_autodetect()
 			should_be = (i&1) ? 28 : 34;
 //			should_be = 28;
 			chip_n = libbitfury_detectChips1(port, should_be);
-			applog(LOG_WARNING, "BITFURY slot %d: %d chips detected", i, chip_n);
+			applog(LOG_WARNING, "BITFURY slot %d/%d: %d chips detected", i/2 + 1, (i&1) + 1, chip_n);
 			if (chip_n)
 			{
 				
@@ -163,13 +163,14 @@ bool metabank_init(struct thr_info *thr)
 		proc->device_data = bitfury;
 		bitfury->spi->cgpu = proc;
 		bitfury_init_chip(proc);
-		if (proc->proc_id == 25) {
-			osc6 = 54;
-		} else if (proc->proc_id == 26) {
-			osc6 = 54;
-		} else if (proc->proc_id == 27 || proc->proc_id == 28) {
+//		if (proc->proc_id == 25) {
+//			osc6 = 55;
+//		} else if (proc->proc_id == 26) {
+//			osc6 = 55;
+//		} else
+		if (proc->proc_id == 27 || proc->proc_id == 28) {
 			printf("AAA proc_id: %d\n", proc->proc_id);
-			osc6 = 52;
+			osc6 = 48;
 		} else {
 			osc6 = 55;
 		}

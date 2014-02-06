@@ -513,19 +513,19 @@ void bitfury_do_io(struct thr_info * const master_thr)
 		
 		if (newbuf[0xf] != oldbuf[0xf])
 		{
-			memcpy(newbuf, oldbuf, 17 *4);
+//			memcpy(newbuf, oldbuf, 17 *4);
 
-//			inc_hw_errors2(thr, NULL, NULL);
-//			if (unlikely(++bitfury->desync_counter >= 4))
-//			{
-//				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
-//				       proc->proc_repr);
-//				bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
-//				bitfury_init_oldbuf(proc, inp);
-//				continue;
-//			}
-//			applog(LOG_DEBUG, "%"PRIpreprv": Previous nonce mismatch, ignoring response",
-//			       proc->proc_repr);
+			inc_hw_errors2(thr, NULL, NULL);
+			if (unlikely(++bitfury->desync_counter >= 4))
+			{
+				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
+				       proc->proc_repr);
+				bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+				bitfury_init_oldbuf(proc, inp);
+				continue;
+			}
+			applog(LOG_DEBUG, "%"PRIpreprv": Previous nonce mismatch, ignoring response",
+			       proc->proc_repr);
 			goto out;
 		}
 		else
