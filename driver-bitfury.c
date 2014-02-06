@@ -40,7 +40,7 @@
 
 BFG_REGISTER_DRIVER(bitfury_drv)
 
-#define DEBUG_CHIP 1200
+#define DEBUG_CHIP 2430
 
 static
 int bitfury_autodetect()
@@ -513,9 +513,6 @@ void bitfury_do_io(struct thr_info * const master_thr)
 		
 		if (newbuf[0xf] != oldbuf[0xf])
 		{
-			if (j == DEBUG_CHIP) { 
-				printf("AAA chip %d: %08x != %08x\n", j, newbuf[0xf],  oldbuf[0xf]);
-			}
 			memcpy(newbuf, oldbuf, 17 *4);
 
 //			inc_hw_errors2(thr, NULL, NULL);
@@ -523,6 +520,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 //			{
 //				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
 //				       proc->proc_repr);
+//				bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
 //				bitfury_init_oldbuf(proc, inp);
 //				continue;
 //			}
@@ -713,7 +711,7 @@ out:
 			copy_time(tvp_stat, &tv_now);
 	}
 	
-	timer_set_delay_from_now(&master_thr->tv_poll, 10000000 / n_chips);
+	timer_set_delay_from_now(&master_thr->tv_poll, 1000);
 }
 
 int64_t bitfury_job_process_results(struct thr_info *thr, struct work *work, bool stopping)

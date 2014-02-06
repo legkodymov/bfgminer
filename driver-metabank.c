@@ -101,7 +101,7 @@ int metabank_autodetect()
 			dummy_bitfury.slot = i;
 			
 			should_be = (i&1) ? 28 : 34;
-			should_be = 14;
+//			should_be = 28;
 			chip_n = libbitfury_detectChips1(port, should_be);
 			applog(LOG_WARNING, "BITFURY slot %d: %d chips detected", i, chip_n);
 			if (chip_n)
@@ -157,14 +157,25 @@ bool metabank_init(struct thr_info *thr)
 	
 	for (proc = thr->cgpu; proc; proc = proc->next_proc)
 	{
+		int osc6;
 		devicelist = proc->device_data;
 		bitfury = devicelist[proc->proc_id];
 		proc->device_data = bitfury;
 		bitfury->spi->cgpu = proc;
 		bitfury_init_chip(proc);
-		bitfury->osc6_bits = 52;
+		if (proc->proc_id == 25) {
+			osc6 = 54;
+		} else if (proc->proc_id == 26) {
+			osc6 = 54;
+		} else if (proc->proc_id == 27 || proc->proc_id == 28) {
+			printf("AAA proc_id: %d\n", proc->proc_id);
+			osc6 = 52;
+		} else {
+			osc6 = 55;
+		}
+		bitfury->osc6_bits = osc6;
 		bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
-		bitfury_init_freq_stat(&bitfury->chip_stat, 52, 52);
+		bitfury_init_freq_stat(&bitfury->chip_stat, osc6, osc6);
 		
 		if (proc->proc_id == proc->procs - 1)
 			free(devicelist);

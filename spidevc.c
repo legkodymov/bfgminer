@@ -98,7 +98,7 @@ static
 int spi_reset(int a)
 {
 	int i,j;
-	int len = 32;
+	int len = 256;
 	INP_GPIO(10); OUT_GPIO(10);
 	INP_GPIO(11); OUT_GPIO(11);
 	GPIO_SET = 1 << 11; // Set SCK
