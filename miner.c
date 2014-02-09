@@ -8933,8 +8933,11 @@ void mt_disable_start(struct thr_info *mythr)
 		drv->thread_disable(mythr);
 	
 	hashmeter2(mythr);
-	if (mythr->prev_work)
-		free_work(mythr->prev_work);
+	if (mythr->prev4_work)
+		free_work(mythr->prev4_work);
+	mythr->prev4_work = mythr->prev3_work;
+	mythr->prev3_work = mythr->prev2_work;
+	mythr->prev2_work = mythr->prev_work;
 	mythr->prev_work = mythr->work;
 	mythr->work = NULL;
 	mythr->_job_transition_in_progress = false;

@@ -40,7 +40,7 @@
 
 BFG_REGISTER_DRIVER(bitfury_drv)
 
-#define DEBUG_CHIP 2430
+#define DEBUG_CHIP 100
 
 static
 int bitfury_autodetect()
@@ -421,6 +421,8 @@ void bitfury_do_io(struct thr_info * const master_thr)
 	struct timeval tv_now;
 	uint32_t counter;
 	struct timeval *tvp_stat;
+	long long unsigned int diff_lastgood;
+	struct timeval diff_time;
 
 	for (proc = master_thr->cgpu; proc; proc = proc->next_proc)
 		++n_chips;
@@ -485,6 +487,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 		c = &bitfury->chip_stat;
 		uint32_t * const newbuf = &bitfury->newbuf[0];
 		uint32_t * const oldbuf = &bitfury->oldbuf[0];
+		uint32_t * const oinp = &bitfury->oinp[0];
 		
 		inp = rxbuf[j];
 		
@@ -500,37 +503,59 @@ void bitfury_do_io(struct thr_info * const master_thr)
 		// To avoid dealing with wrap-around entirely, we rotate array so previous active uint32_t is at index 0
 		memcpy(&newbuf[0], &inp[bitfury->active], 4 * (0x10 - bitfury->active));
 		memcpy(&newbuf[0x10 - bitfury->active], &inp[0], 4 * bitfury->active);
-		newjob = inp[0x10];
+//		newjob = inp[0x10];
+		newjob = !bitfury->oldjob;
+		newbuf[16] = inp[0x10];
 
-		if (j == DEBUG_CHIP) { 
-			int x;
-			printf("AAA chip %d: ", j);
-			for (x = 0; x < 17; x++) {
-				printf(" %08x", newbuf[x]);
-			}
-			printf("\n");
-		}
-		
+//		if (j == DEBUG_CHIP) { 
+//			int x;
+//			printf("AAA chip %d: ", j);
+//			for (x = 0; x < 17; x++) {
+//				printf(" %08x",inp[x]);
+//			}
+//			printf("\n");
+//		}
+
 		if (newbuf[0xf] != oldbuf[0xf])
 		{
-//			memcpy(newbuf, oldbuf, 17 *4);
+			int x;
+//			printf("AAA BAD chip %d: \nOld: ", j);
+//			for (x = 0; x < 17; x++) {
+//				if (oinp[x] != inp[x]) {
+//					printf(" %08x", oinp[x]);
+//				} else {
+//					printf("         ");
+//				}
+//			}
+//			printf("\nInp: ");
+//			for (x = 0; x < 17; x++) {
+//				if (oinp[x] != inp[x]) {
+//					printf(" %08x", inp[x]);
+//				} else {
+//					printf("         ");
+//				}
+//			}
+//			printf("\n");
+			memcpy(newbuf, oldbuf, 17 *4);
 
-			inc_hw_errors2(thr, NULL, NULL);
-			if (unlikely(++bitfury->desync_counter >= 4))
-			{
-				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
-				       proc->proc_repr);
-				bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
-				bitfury_init_oldbuf(proc, inp);
-				continue;
-			}
-			applog(LOG_DEBUG, "%"PRIpreprv": Previous nonce mismatch, ignoring response",
-			       proc->proc_repr);
+//			inc_hw_errors2(thr, NULL, NULL);
+//			if (unlikely(++bitfury->desync_counter >= 4))
+//			{
+//				applog(LOG_WARNING, "%"PRIpreprv": Previous nonce mismatch (4th try), recalibrating",
+//				       proc->proc_repr);
+//				bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+//				bitfury_init_oldbuf(proc, inp);
+//				continue;
+//			}
+//			applog(LOG_DEBUG, "%"PRIpreprv": Previous nonce mismatch, ignoring response",
+//			       proc->proc_repr);
+			memcpy(oinp, inp, 17 * 4);
 			goto out;
 		}
 		else
 			bitfury->desync_counter = 0;
-		
+		memcpy(oinp, inp, 17 * 4);
+
 		if (bitfury->oldjob != newjob && thr->next_work)
 		{
 			mt_job_transition(thr);
@@ -538,13 +563,13 @@ void bitfury_do_io(struct thr_info * const master_thr)
 			timer_set_now(&thr->tv_morework);
 			job_start_complete(thr);
 		}
-		
+
 		for (n = 0; newbuf[n] == oldbuf[n]; ++n)
 		{
 			if (unlikely(n >= 0xf))
 			{
 				inc_hw_errors2(thr, NULL, NULL);
-				applog(LOG_DEBUG, "%"PRIpreprv": Full result match, reinitialising",
+				applog(LOG_WARNING, "%"PRIpreprv": Full result match, reinitialising",
 				       proc->proc_repr);
 				bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
 				bitfury->desync_counter = 99;
@@ -571,15 +596,15 @@ void bitfury_do_io(struct thr_info * const master_thr)
 				ns = (double)period / (double)(cycles);
 				bitfury->mhz = 1.0 / ns * 65.0 * 1000.0;
 				
-				if (bitfury->mhz_best)
-				{
+//				if (bitfury->mhz_best)
+//				{
 //					if (bitfury->mhz < bitfury->mhz_best / 2)
 //					{
 //						applog(LOG_WARNING, "%"PRIpreprv": Frequency drop over 50%% detected, reinitialising",
 //						       proc->proc_repr);
 //						bitfury->force_reinit = true;
 //					}
-				}
+//				}
 				if ((int)bitfury->mhz > bitfury->mhz_best && bitfury->mhz_last > bitfury->mhz_best)
 				{
 					// mhz_best is the lowest of two sequential readings over the previous best
@@ -609,8 +634,8 @@ void bitfury_do_io(struct thr_info * const master_thr)
 				// Copy current statistics
 				mh_diff = bitfury->counter2 - c->omh;
 				s_diff = total_secs - c->os;
-				applog(LOG_WARNING, "%"PRIpreprv": %.0f completed in %f seconds",
-				       proc->proc_repr, mh_diff, s_diff);
+//				applog(LOG_WARNING, "%"PRIpreprv": %.0f completed in %f seconds",
+//				       proc->proc_repr, mh_diff, s_diff);
 				if (osc >= c->osc6_min && osc <= c->osc6_max)
 				{
 					c->mh[osc] += mh_diff;
@@ -628,14 +653,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 					applog(LOG_DEBUG, "%"PRIpreprv":%s",
 					       proc->proc_repr, logbuf);
 				}
-				
-				// Change freq;
-				if (!c->best_done) {
-					bitfury_select_freq(bitfury, proc);
-				} else {
-					applog(LOG_WARNING, "%"PRIpreprv": Stable freq, osc6_bits: %d",
-					       proc->proc_repr, bitfury->osc6_bits);
-				}
+//				bitfury_select_freq(bitfury, proc);
 			}
 		}
 		
@@ -656,6 +674,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 					if (j == DEBUG_CHIP) {
 						printf("AAA SUBMIT: %d, nonce: %08x\n", i, nonce);
 					}
+					copy_time(&(bitfury->tv_lastgood), &tv_now);
 				}
 				else
 				if (fudge_nonce(thr->prev_work, &nonce))
@@ -667,31 +686,73 @@ void bitfury_do_io(struct thr_info * const master_thr)
 					if (j == DEBUG_CHIP) {
 						printf("AAA PREV_SUBMIT: %d, nonce: %08x\n", i, nonce);
 					}
-				}
-				else
+					copy_time(&(bitfury->tv_lastgood), &tv_now);
+				} else
+				if (fudge_nonce(thr->prev2_work, &nonce))
 				{
+					applog(LOG_DEBUG, "%"PRIpreprv": nonce %x = %08lx (prev2 work=%p)",
+					       proc->proc_repr, i, (unsigned long)nonce, thr->prev2_work);
+					submit_nonce(thr, thr->prev2_work, nonce);
+					bitfury->counter2 += 1;
 					if (j == DEBUG_CHIP) {
-						printf("AAA STRANGE+1: %d, nonce: %08x\n", j, nonce);
+						printf("AAA PREV222222222_SUBMIT: %d, nonce: %08x\n", i, nonce);
 					}
+					copy_time(&(bitfury->tv_lastgood), &tv_now);
+				} else
+				if (fudge_nonce(thr->prev3_work, &nonce))
+				{
+					applog(LOG_DEBUG, "%"PRIpreprv": nonce %x = %08lx (prev3 work=%p)",
+					       proc->proc_repr, i, (unsigned long)nonce, thr->prev3_work);
+					submit_nonce(thr, thr->prev3_work, nonce);
+					bitfury->counter2 += 1;
+					if (j == DEBUG_CHIP) {
+						printf("AAA PREV333333333_SUBMIT: %d, nonce: %08x\n", i, nonce);
+					}
+					copy_time(&(bitfury->tv_lastgood), &tv_now);
+				} else
+				if (fudge_nonce(thr->prev4_work, &nonce))
+				{
+					applog(LOG_DEBUG, "%"PRIpreprv": nonce %x = %08lx (prev4 work=%p)",
+					       proc->proc_repr, i, (unsigned long)nonce, thr->prev4_work);
+					submit_nonce(thr, thr->prev4_work, nonce);
+					bitfury->counter2 += 1;
+					if (j == DEBUG_CHIP) {
+						printf("AAA PREV444444444_SUBMIT: %d, nonce: %08x\n", i, nonce);
+					}
+					copy_time(&(bitfury->tv_lastgood), &tv_now);
+				} else
+				{
+//					printf("AAA STRANGE+1: %d, nonce: %08x\n", j, nonce);
 					inc_hw_errors(thr, thr->work, nonce);
 					++bitfury->sample_hwe;
 					bitfury->strange_counter += 1;
 				}
 				if (++bitfury->sample_tot >= 0x40 || bitfury->sample_hwe >= 8)
 				{
-					if (bitfury->sample_hwe >= 8)
-					{
-						applog(LOG_WARNING, "%"PRIpreprv": %d of the last %d results were bad, reinitialising",
-						       proc->proc_repr, bitfury->sample_hwe, bitfury->sample_tot);
-						bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
-						bitfury->desync_counter = 99;
-					}
-					bitfury->sample_tot = bitfury->sample_hwe = 0;
+//					if (bitfury->sample_hwe >= 8)
+//					{
+//						applog(LOG_WARNING, "%"PRIpreprv": %d of the last %d results were bad, reinitialising",
+//						       proc->proc_repr, bitfury->sample_hwe, bitfury->sample_tot);
+//						bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
+//						bitfury->desync_counter = 99;
+//					}
+//					bitfury->sample_tot = bitfury->sample_hwe = 0;
 				}
 			}
 			bitfury->active = (bitfury->active + n) % 0x10;
 		}
-		
+
+		timersub(&(tv_now), &(bitfury->tv_lastgood), &diff_time);
+		diff_lastgood = timeval_to_us(&diff_time) / 1000ULL;
+		if (diff_lastgood > 25 * 1000) {
+			bitfury->force_reinit = true;
+			printf("AAA %d chip DEAD !!!!!!!1\n", j);
+			copy_time(&(bitfury->tv_lastgood), &tv_now);
+		}
+		if (j == DEBUG_CHIP) {
+			printf("AAA chip: j: %d, diff_lastgood: %u\n", j, diff_lastgood);
+		}
+
 		memcpy(&oldbuf[0], &newbuf[n], 4 * (0x10 - n));
 		memcpy(&oldbuf[0x10 - n], &newbuf[0], 4 * n);
 		bitfury->oldjob = newjob;
@@ -699,7 +760,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 out:
 		if (unlikely(bitfury->force_reinit))
 		{
-			applog(LOG_DEBUG, "%"PRIpreprv": Forcing reinitialisation",
+			applog(LOG_WARNING, "%"PRIpreprv": Forcing reinitialisation",
 			       proc->proc_repr);
 			bitfury_send_reinit(bitfury->spi, bitfury->slot, bitfury->fasync, bitfury->osc6_bits);
 			bitfury->desync_counter = 99;
@@ -711,7 +772,7 @@ out:
 			copy_time(tvp_stat, &tv_now);
 	}
 	
-	timer_set_delay_from_now(&master_thr->tv_poll, 1000);
+	timer_set_delay_from_now(&master_thr->tv_poll, 100000);
 }
 
 int64_t bitfury_job_process_results(struct thr_info *thr, struct work *work, bool stopping)
@@ -790,7 +851,7 @@ char *bitfury_set_device(struct cgpu_info * const proc, char * const option, cha
 			return replybuf;
 		
 		bitfury->osc6_bits = newval;
-		bitfury->force_reinit = true;
+//		bitfury->force_reinit = true;
 		c->osc6_max = 0;
 		
 		return NULL;
@@ -829,7 +890,7 @@ const char *bitfury_tui_handle_choice(struct cgpu_info *cgpu, int input)
 				return "Invalid oscillator bits\n";
 			
 			bitfury->osc6_bits = val;
-			bitfury->force_reinit = true;
+//			bitfury->force_reinit = true;
 			c->osc6_max = 0;
 			
 			return "Oscillator bits changing\n";

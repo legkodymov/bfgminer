@@ -36,6 +36,7 @@ struct bitfury_device {
 	unsigned char osc6_bits;
 	unsigned newbuf[17];
 	unsigned oldbuf[17];
+	unsigned oinp[17];
 	bool oldjob;
 	int active;
 	uint32_t atrvec[20];
@@ -43,6 +44,7 @@ struct bitfury_device {
 	struct freq_stat chip_stat;
 	struct timeval timer1;
 	struct timeval tv_stat;
+	struct timeval tv_lastgood;
 	unsigned int counter1, counter2;
 	double mhz;
 	int mhz_last;

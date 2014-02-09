@@ -371,8 +371,11 @@ void mt_job_transition(struct thr_info *mythr)
 	if (mythr->starting_next_work)
 	{
 		mythr->next_work->tv_work_start = tv_now;
-		if (mythr->prev_work)
-			free_work(mythr->prev_work);
+		if (mythr->prev4_work)
+			free_work(mythr->prev4_work);
+		mythr->prev4_work = mythr->prev3_work;
+		mythr->prev3_work = mythr->prev2_work;
+		mythr->prev2_work = mythr->prev_work;
 		mythr->prev_work = mythr->work;
 		mythr->work = mythr->next_work;
 		mythr->next_work = NULL;

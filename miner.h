@@ -636,6 +636,9 @@ struct thr_info {
 
 	// Used by minerloop_async
 	struct work *prev_work;
+	struct work *prev2_work;
+	struct work *prev3_work;
+	struct work *prev4_work;
 	struct work *work;
 	struct work *next_work;
 	enum thr_busy_state busy_state;

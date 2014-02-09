@@ -5,7 +5,7 @@
 #include <stdint.h>
 #include <unistd.h>
 
-#define SPIMAXSZ (256*1024)
+#define SPIMAXSZ (512*1024)
 
 /* Initialize SPI using this function */
 void spi_init(void);
