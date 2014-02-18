@@ -265,9 +265,9 @@ int libbitfury_detect_chip(struct spi_port *port, int chip_n) {
 			unsigned int cdiff = libbitfury_c_diff(ocounter, counter);
 
 //			printf("AAA cdiff: %d, odiff: %d\n", cdiff, odiff);
-			if (cdiff > 500*BITFURY_REFRESH_DELAY &&
+			if (cdiff > 200*BITFURY_REFRESH_DELAY &&
 				cdiff < 8000*BITFURY_REFRESH_DELAY &&
-				odiff > 500*BITFURY_REFRESH_DELAY &&
+				odiff > 200*BITFURY_REFRESH_DELAY &&
 				odiff < 8000*BITFURY_REFRESH_DELAY)
 				return 1;
 			odiff = cdiff;

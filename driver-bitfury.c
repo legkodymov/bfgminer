@@ -40,7 +40,7 @@
 
 BFG_REGISTER_DRIVER(bitfury_drv)
 
-#define DEBUG_CHIP 100
+#define DEBUG_CHIP 1000
 
 static
 int bitfury_autodetect()
@@ -744,9 +744,8 @@ void bitfury_do_io(struct thr_info * const master_thr)
 
 		timersub(&(tv_now), &(bitfury->tv_lastgood), &diff_time);
 		diff_lastgood = timeval_to_us(&diff_time) / 1000ULL;
-		if (diff_lastgood > 25 * 1000) {
+		if (diff_lastgood > 30 * 1000) {
 			bitfury->force_reinit = true;
-			printf("AAA %d chip DEAD !!!!!!!1\n", j);
 			copy_time(&(bitfury->tv_lastgood), &tv_now);
 		}
 		if (j == DEBUG_CHIP) {
