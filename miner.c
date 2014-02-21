@@ -8414,7 +8414,11 @@ retry:
 		{
 			if (likely(opt_queue < 10 + mining_threads))
 			{
-				++opt_queue;
+				if (opt_queue < 50) {
+					opt_queue = 50;
+				} else {
+					++opt_queue;
+				}
 				applog(LOG_WARNING, "Staged work underrun; increasing queue minimum to %d", opt_queue);
 			}
 			else

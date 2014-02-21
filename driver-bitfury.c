@@ -744,7 +744,7 @@ void bitfury_do_io(struct thr_info * const master_thr)
 
 		timersub(&(tv_now), &(bitfury->tv_lastgood), &diff_time);
 		diff_lastgood = timeval_to_us(&diff_time) / 1000ULL;
-		if (diff_lastgood > 30 * 1000) {
+		if (diff_lastgood > 20 * 1000) {
 			bitfury->force_reinit = true;
 			copy_time(&(bitfury->tv_lastgood), &tv_now);
 		}
